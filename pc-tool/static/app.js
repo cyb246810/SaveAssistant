@@ -151,10 +151,55 @@ function showToast(msg, level) {
 
 function openFile(path) { api("/api/open-file?path=" + encodeURIComponent(path)); }
 
+/**
+ * 规整用户填的目录：剥掉首尾成对引号与结尾分隔符。
+ * 资源管理器「复制文件地址」复制出来的路径自带双引号，直接粘进来会让目录不可用。
+ * 服务端也会做同样处理，这里做一遍是为了让用户当场看到「实际会用哪个路径」。
+ */
+function cleanDir(p) {
+  let s = String(p == null ? "" : p).trim();
+  const pairs = [['"', '"'], ["'", "'"], ["\u201c", "\u201d"], ["\u2018", "\u2019"],
+                 ["\u300c", "\u300d"], ["\u300e", "\u300f"]];
+  for (let k = 0; k < 3; k++) {
+    let hit = false;
+    for (const [a, b] of pairs) {
+      if (s.length >= 2 && s.startsWith(a) && s.endsWith(b)) {
+        s = s.slice(a.length, s.length - b.length).trim();
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) break;
+  }
+  // 去掉结尾多余的分隔符，但别把 "D:\\" 这种根路径削成 "D:"（与服务端逻辑保持一致）
+  while (s.length > 3 && /[\\/]$/.test(s)) s = s.slice(0, -1);
+  return s;
+}
+
 $("btnChangeDir").onclick = async () => {
-  const p = prompt("设置接收目录（绝对路径）：", $("transferDir").textContent);
-  if (!p) return;
-  await api("/api/config", { method: "POST", body: JSON.stringify({ transfer_dir: p }) });
+  const raw = prompt("设置接收目录（绝对路径）：", $("transferDir").textContent);
+  if (!raw) return;
+  const cleaned = cleanDir(raw);
+  if (cleaned !== raw.trim()) {
+    showToast("已自动去掉路径里的引号", "info");
+  }
+  let resp, data;
+  try {
+    resp = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ transfer_dir: cleaned }),
+    });
+    data = await resp.json().catch(() => null);
+  } catch (e) {
+    showToast("保存失败：网络错误", "error");
+    return;
+  }
+  if (!resp.ok || !data || data.ok === false) {
+    showToast("目录不可用：" + ((data && data.error) || ("HTTP " + resp.status)), "error");
+    return;
+  }
+  showToast("接收目录已改为：" + data.transfer_dir, "success");
   loadConfig(); loadStatus(); loadFiles();
 };
 $("btnOpenFolder").onclick = () => api("/api/open-folder");

@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "device_name": "我的电脑",
     "transfer_dir": os.path.join(os.path.dirname(BASE), "Received"),
     "auto_open_browser": True,
-    "version": "1.0.3",
+    "version": "1.0.4",
 }
 
 CATEGORY_LABELS = {
@@ -54,6 +54,37 @@ EXT_BY_CATEGORY = {
 # ---------------------------------------------------------------------------
 # 配置读写
 # ---------------------------------------------------------------------------
+def normalize_dir(path):
+    """把用户填的接收目录规整成可用路径。
+
+    最常见的坑：Windows 资源管理器的「复制文件地址」复制出来的路径**自带双引号**，
+    用户直接粘进设置框，引号就成了路径的一部分 —— 表现为目录读写全废
+    （`disk_usage` 报错、`isdir` 为假、收到的文件不知道去哪了）。
+    这里统一剥掉首尾空白、成对引号，并去掉结尾多余的分隔符。
+
+    注意中文引号 `“ ”` 是两个**不同**的字符，不能靠 `p[0] == p[-1]` 判断，
+    必须按「开引号 → 闭引号」配对来剥。
+    """
+    if not path:
+        return path
+    p = str(path).strip()
+    pairs = [('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("「", "」"), ("『", "』")]
+    # 可能叠了多层（例如复制两次），最多剥 3 层
+    for _ in range(3):
+        if len(p) < 2:
+            break
+        for opener, closer in pairs:
+            if p.startswith(opener) and p.endswith(closer):
+                p = p[len(opener):len(p) - len(closer)].strip()
+                break
+        else:
+            break
+    # 去掉结尾多余的分隔符（但别把 "D:\\" 这种根路径削成 "D:"）
+    while len(p) > 3 and p[-1] in ("\\", "/"):
+        p = p[:-1]
+    return p
+
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
@@ -61,6 +92,8 @@ def load_config():
                 cfg = json.load(f)
             merged = dict(DEFAULT_CONFIG)
             merged.update(cfg)
+            # 防御性修正历史坏值（例如 path 里混进了引号）
+            merged["transfer_dir"] = normalize_dir(merged.get("transfer_dir"))
             return merged
         except Exception:
             pass
@@ -129,9 +162,9 @@ def free_space(path):
 
 
 def secure_filename(name):
-    if not name:
+    if not name or not str(name).strip():
         return "file"
-    name = os.path.basename(name.replace("\\", "/"))
+    name = os.path.basename(str(name).replace("\\", "/"))
     # 去掉可能的风险字符，保留中文与常用符号
     keep = []
     for ch in name:
@@ -428,14 +461,32 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             changed = False
+            rejected = None
             if "transfer_dir" in data and data["transfer_dir"]:
-                new_dir = data["transfer_dir"]
-                CFG["transfer_dir"] = new_dir
-                TRANSFER_DIR = new_dir
-                changed = True
+                # 用户粘进来的路径可能带引号（资源管理器「复制文件地址」就会带），
+                # 也可能带结尾反斜杠；统一规整后再用。
+                new_dir = normalize_dir(data["transfer_dir"])
+                if not new_dir:
+                    rejected = "接收目录不能为空"
+                else:
+                    try:
+                        os.makedirs(new_dir, exist_ok=True)
+                        # 真写一个探针文件，确认不只是建了目录而且可写
+                        probe = os.path.join(new_dir, ".sa_write_test")
+                        with open(probe, "w", encoding="utf-8") as f:
+                            f.write("ok")
+                        os.remove(probe)
+                        CFG["transfer_dir"] = new_dir
+                        TRANSFER_DIR = new_dir
+                        changed = True
+                    except Exception as e:
+                        rejected = f"这个目录用不了：{e}"
             if "device_name" in data and data["device_name"]:
                 CFG["device_name"] = data["device_name"]
                 changed = True
+            if rejected:
+                return self._send_json(400, {"ok": False, "error": rejected,
+                                             "transfer_dir": CFG["transfer_dir"]})
             if changed:
                 save_config(CFG)
                 ensure_transfer_dir()
@@ -444,7 +495,7 @@ class Handler(BaseHTTPRequestHandler):
                     "device_name": CFG["device_name"],
                     "transfer_dir": TRANSFER_DIR,
                 }})
-            return self._send_json(200, {"ok": True})
+            return self._send_json(200, {"ok": True, "transfer_dir": TRANSFER_DIR})
 
         if path == "/api/shutdown":
             self._send_json(200, {"ok": True})
@@ -558,7 +609,7 @@ def udp_discovery_server():
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", port))
     except OSError as e:
-        print(f"[保存助手] UDP 发现端口 {port} 绑定失败：{e}")
+        log(f"UDP 发现端口 {port} 绑定失败：{e}")
         return
     while True:
         try:
@@ -575,9 +626,71 @@ def udp_discovery_server():
             pass
 
 
+LOG_PATH = os.path.join(BASE, "server.log")
+
+
+def log(msg):
+    """写一行启动/运行日志。
+
+    pythonw.exe 没有控制台，print 出去没人看得到；用户看到的现象只是「双击没反应」。
+    所以关键信息必须落到文件，出问题时能直接查。
+    """
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    try:
+        print(line)
+    except Exception:
+        pass
+
+
+def fatal_dialog(msg):
+    """用系统弹窗把致命错误显示出来。
+
+    pythonw 下没有控制台，异常默认是「静默死亡」——用户只会觉得快捷方式打不开。
+    弹一个框，至少让人知道发生了什么、该去哪看日志。
+
+    带 --no-dialog 参数时只记日志不弹窗（脚本化测试/无人值守用）。
+    """
+    if "--no-dialog" in sys.argv:
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            msg + "\n\n详细信息见：\n" + LOG_PATH,
+            "保存助手 · 电脑端传输工作台",
+            0x10,  # MB_ICONERROR
+        )
+    except Exception:
+        pass
+
+
 def main():
-    ensure_transfer_dir()
-    refresh_records()
+    # 启动阶段的异常绝不能静默退出：pythonw 无控制台，用户只会看到「双击没反应」。
+    global TRANSFER_DIR
+    try:
+        ensure_transfer_dir()
+    except Exception as e:
+        log(f"接收目录不可用：{TRANSFER_DIR!r}（{e}）—— 退回默认目录")
+        TRANSFER_DIR = DEFAULT_CONFIG["transfer_dir"]
+        CFG["transfer_dir"] = TRANSFER_DIR
+        try:
+            ensure_transfer_dir()
+            save_config(CFG)
+        except Exception as e2:
+            log(f"默认目录同样不可用：{e2}")
+            fatal_dialog(f"接收目录无法创建：\n{CFG.get('transfer_dir')}\n\n{e2}")
+            return
+
+    try:
+        refresh_records()
+    except Exception as e:
+        log(f"扫描已接收文件失败：{e}")
+
     threading.Thread(target=device_cleaner, daemon=True).start()
     threading.Thread(target=udp_discovery_server, daemon=True).start()
 
@@ -589,30 +702,41 @@ def main():
         server = TransferServer((host, port), Handler)
     except OSError as e:
         # 端口已被占用：多半是服务已在运行，直接打开工作台即可
-        print(f"[保存助手] 端口 {port} 已被占用（服务可能已在运行）：{e}")
+        log(f"端口 {port} 已被占用（服务可能已在运行）：{e} —— 改为直接打开工作台")
         if CFG.get("auto_open_browser", True) and "--no-browser" not in sys.argv:
             try:
                 webbrowser.open(url)
-            except Exception:
-                pass
+            except Exception as e2:
+                log(f"打开浏览器失败：{e2}")
         return
 
-    print(f"[保存助手] 传输工作台已启动：{url}")
-    print(f"[保存助手] 局域网接收目录：{TRANSFER_DIR}")
-    print(f"[保存助手] 本机局域网 IP：{', '.join(local_ips())}  端口：{port}")
+    log(f"传输工作台已启动：{url}")
+    log(f"局域网接收目录：{TRANSFER_DIR}")
+    log(f"本机局域网 IP：{', '.join(local_ips())}  端口：{port}")
     if CFG.get("auto_open_browser", True) and "--no-browser" not in sys.argv:
         try:
             webbrowser.open(url)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"打开浏览器失败：{e}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        print("[保存助手] 服务已停止。")
+        log("服务已停止。")
 
 
 if __name__ == "__main__":
-    main()
+    # 最外层兜底：任何未预料的异常都要留痕 + 弹窗，
+    # 绝不能让 pythonw 下的进程静默死掉（用户只会看到「双击没反应」）。
+    try:
+        main()
+    except Exception as _top_exc:
+        import traceback
+        _tb = traceback.format_exc()
+        try:
+            log("启动失败：\n" + _tb)
+        except Exception:
+            pass
+        fatal_dialog(f"启动失败：{_top_exc}")
