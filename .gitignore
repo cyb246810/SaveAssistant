@@ -1,0 +1,28 @@
+# ---- Android / Gradle ----
+.gradle/
+**/build/
+local.properties
+
+# ---- 签名材料：绝对不要提交 ----
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
+# ---- 电脑端工作台的本地配置与接收目录 ----
+pc-tool/config.json
+pc-tool/Received/
+__pycache__/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+*.iml
+captures/
+.DS_Store
+Thumbs.db
+
+# ---- 构建产物 ----
+*.apk
+*.aab
+*.ap_
+*.dex

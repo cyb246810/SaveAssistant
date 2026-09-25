@@ -1,0 +1,23 @@
+pluginManagement {
+    repositories {
+        if (System.getenv('LOCAL_MAVEN_REPO')) {
+            maven { url uri(System.getenv('LOCAL_MAVEN_REPO')) }
+        }
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        if (System.getenv('LOCAL_MAVEN_REPO')) {
+            maven { url uri(System.getenv('LOCAL_MAVEN_REPO')) }
+        }
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "VideoSaver"
+include ':app'
+include ':editor'

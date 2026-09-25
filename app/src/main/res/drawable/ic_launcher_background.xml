@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <!-- 铺满深色底，避免启动器在自适应图标外侧露出白圈。 -->
+    <solid android:color="#FF202124" />
+</shape>

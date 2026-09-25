@@ -1,0 +1,18 @@
+# 默认按文本处理并统一成 LF。
+# 注意：gradlew 是 shell 脚本，必须是 LF，否则在 macOS/Linux 上会报
+# "/bin/sh^M: bad interpreter"。
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不要做任何换行/编码转换
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.apk binary
+*.jks  binary

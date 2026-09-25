@@ -1,0 +1,13 @@
+buildscript {
+    configurations.classpath.resolutionStrategy.force 'org.jetbrains.kotlin:kotlin-reflect:2.0.21'
+    repositories {
+        if (System.getenv('LOCAL_MAVEN_REPO')) {
+            maven { url uri(System.getenv('LOCAL_MAVEN_REPO')) }
+        }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.2'
+    }
+}

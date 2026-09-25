@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>保存助手 · 传输工作台</title>
+  <link rel="icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-logo" src="/logo.svg" alt="logo" />
+      <div class="brand-text">
+        <div class="brand-title">保存助手</div>
+        <div class="brand-sub">传输工作台</div>
+      </div>
+      <span class="ver-badge" id="verBadge">v1.0.0</span>
+    </div>
+    <div class="status-pill" id="statusPill">
+      <span class="dot dot-on"></span><span id="statusText">本机在线</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左列：设备与连接 -->
+    <section class="col-left">
+      <div class="card">
+        <div class="card-title">本机信息</div>
+        <div class="kv"><span class="k">设备名称</span><span class="v" id="deviceName">—</span></div>
+        <div class="kv"><span class="k">局域网 IP</span><span class="v" id="localIps">—</span></div>
+        <div class="kv"><span class="k">监听端口</span><span class="v" id="port">—</span></div>
+        <div class="kv block">
+          <span class="k">接收目录</span>
+          <span class="v path" id="transferDir">—</span>
+          <button class="btn-ghost" id="btnChangeDir">更改</button>
+        </div>
+        <div class="kv block">
+          <span class="k">剩余空间</span>
+          <div class="space">
+            <div class="space-bar"><div class="space-fill" id="spaceFill"></div></div>
+            <span class="v small" id="freeSpace">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card grow">
+        <div class="card-title">已连接设备</div>
+        <div id="deviceList" class="device-list">
+          <div class="empty">等待手机端连接…<br /><small>手机端「电脑传输」会在此出现</small></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右列：统计 + 队列 + 文件 -->
+    <section class="col-right">
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-num" id="statToday">0</div>
+          <div class="stat-label">今日接收</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num" id="statCount">0</div>
+          <div class="stat-label">文件总数</div>
+        </div>
+        <div class="stat">
+          <div class="stat-num" id="statSize">0 B</div>
+          <div class="stat-label">已接收总量</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">传输队列</div>
+        <div id="queue" class="queue">
+          <div class="empty small">暂无传输</div>
+        </div>
+      </div>
+
+      <div class="card grow">
+        <div class="card-title">最近文件</div>
+        <div id="fileGrid" class="file-grid">
+          <div class="empty small">还没有收到文件</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="foot-note">仅限同一局域网 · 文件不经过外网</div>
+    <div class="foot-actions">
+      <button class="btn-ghost" id="btnOpenFolder">打开接收文件夹</button>
+    </div>
+  </footer>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
