@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import uuid
+import socket
 import threading
 import mimetypes
 import webbrowser
@@ -30,7 +31,7 @@ DEFAULT_CONFIG = {
     "device_name": "我的电脑",
     "transfer_dir": os.path.join(os.path.dirname(BASE), "Received"),
     "auto_open_browser": True,
-    "version": "1.0.4",
+    "version": "1.0.5",
 }
 
 CATEGORY_LABELS = {
@@ -183,6 +184,30 @@ def ensure_transfer_dir():
         os.makedirs(os.path.join(TRANSFER_DIR, cat), exist_ok=True)
 
 
+def cleanup_part_files():
+    """启动时清掉所有 .part 残留。
+
+    上传是先写 .part、校验通过再原子改名。所以启动时还存在的 .part
+    一定是「上一次没传完就中断」的产物，属于垃圾，直接删掉；
+    绝不能让它们被磁盘扫描当成已接收的文件。
+    """
+    removed = 0
+    for cat in CATEGORY_LABELS:
+        d = os.path.join(TRANSFER_DIR, cat)
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if fn.endswith(".part"):
+                try:
+                    os.remove(os.path.join(d, fn))
+                    removed += 1
+                except Exception:
+                    pass
+    if removed:
+        log(f"已清理 {removed} 个未完成的临时文件（.part）")
+    return removed
+
+
 def scan_disk_records():
     """从磁盘扫描已接收文件，返回记录列表（新→旧）。"""
     out = []
@@ -194,6 +219,9 @@ def scan_disk_records():
             continue
         for fn in os.listdir(d):
             fp = os.path.join(d, fn)
+            # .part 是没传完的临时文件，永远不算「已接收」
+            if fn.endswith(".part"):
+                continue
             if os.path.isfile(fp):
                 st = os.stat(fp)
                 out.append({
@@ -254,6 +282,19 @@ def device_snapshot():
 class Handler(BaseHTTPRequestHandler):
     server_version = "SaveAssistantPC/" + CFG.get("version", "1.0.0")
     protocol_version = "HTTP/1.1"
+
+    # 单次 socket 读写的超时（秒）。之前没设 = 永久阻塞：
+    # 手机端传到一半卡住时，处理线程会一直挂在 rfile.read 上，
+    # 前端那条「进行中…」就永远不会变成「已完成」或「失败」。
+    timeout = 300
+
+    def handle_one_request(self):
+        """把超时异常收敛成一次干净的连接关闭，不再往上抛。"""
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except (socket.timeout, TimeoutError):
+            self.close_connection = True
+            log("连接超时，已关闭（对端长时间没有数据）")
 
     def log_message(self, fmt, *args):
         pass  # 静默日志，避免控制台刷屏
@@ -505,7 +546,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def _read_chunked_body(self, f):
+        """按 chunked 传输编码把请求体写进 f，返回写入的字节数。
+
+        之前完全没处理 chunked：没有 Content-Length 时 length 被当成 0，
+        循环一次都不进，**文件被存成 0 字节却仍然报「已接收」**。
+        """
+        total = 0
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                raise IOError("连接在读取分块长度前中断")
+            size_str = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_str, 16)
+            except ValueError:
+                raise IOError("非法的分块长度：" + repr(size_str[:40]))
+            if size == 0:
+                # 末尾空块，后面可能还有 trailer，读到空行为止
+                while True:
+                    trailer = self.rfile.readline(65536)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                return total
+            remaining = size
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    raise IOError("分块数据提前结束")
+                f.write(chunk)
+                total += len(chunk)
+                remaining -= len(chunk)
+            self.rfile.read(2)   # 吃掉分块末尾的 CRLF
+
     def _handle_upload(self):
+        # 上传响应后主动断开连接：万一客户端实际发送的字节数比声明多，
+        # 残留字节会污染 keep-alive 上的下一个请求——把连接关掉最稳。
+        self.close_connection = True
+
         # 元数据优先从 query 读（URL 百分号编码，天然支持中文，且不受客户端请求头编码限制）；
         # 老客户端仍走 X-SA-* 请求头，这里保留兼容。
         qs = parse_qs(urlparse(self.path).query)
@@ -525,7 +603,15 @@ class Handler(BaseHTTPRequestHandler):
             size_hint = int(pick("size", "X-SA-Size") or 0)
         except (TypeError, ValueError):
             size_hint = 0
-        length = int(self.headers.get("Content-Length", "0") or 0)
+
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        chunked = "chunked" in te
+        length = 0
+        if not chunked:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except (TypeError, ValueError):
+                length = 0
 
         safe = secure_filename(name)
         if not os.path.splitext(safe)[1]:
@@ -541,23 +627,67 @@ class Handler(BaseHTTPRequestHandler):
                 i += 1
             dest = os.path.join(cat_dir, f"{base}({i}){ext}")
 
-        started = time.time()
         rid = uuid.uuid4().hex
-        received = 0
+
+        # 既没有 Content-Length 也不是 chunked，说明客户端没告诉我们有多长。
+        # 这时继续读只会得到 0 字节的「假成功」，不如明确拒绝并说清原因。
+        if not chunked and length <= 0:
+            emit({"type": "upload_failed", "id": rid, "name": safe,
+                  "error": "缺少 Content-Length 且未使用分块编码"})
+            return self._send_json(411, {
+                "ok": False,
+                "error": "缺少 Content-Length：请用定长或 chunked 方式上传",
+            })
+
+        # 客户端自相矛盾时直接拒绝：query 里报的大小和 HTTP 声明的长度必须一致。
+        # 不一致说明客户端文件大小记录已经过期（长视频的 _size 尤其容易），
+        # 这种情况下落盘的文件根本不是手机以为的那份，宁可报错也不要存一份坏的。
+        if not chunked and size_hint > 0 and length != size_hint:
+            msg = (f"客户端自报大小 {size_hint} 字节，但 HTTP 声明的长度是 {length} 字节，"
+                   f"两者不一致，已拒绝接收")
+            log(f"拒绝 {safe}：{msg}")
+            emit({"type": "upload_failed", "id": rid, "name": safe, "error": msg})
+            return self._send_json(400, {"ok": False, "error": msg})
+
         emit({"type": "upload_started", "id": rid, "name": safe,
               "category": cat, "category_label": CATEGORY_LABELS[cat],
-              "device": dev, "size": size_hint})
+              "device": dev, "size": max(size_hint, length)})
+
+        # 先写 .part，全部校验通过后再原子改名。
+        # 这样「传到一半断线」永远不会在接收目录里留下一个看起来正常的文件，
+        # 重启时的磁盘扫描也就不会把半截文件当成已接收的成品。
+        part = dest + ".part"
+        received = 0
+        started = time.time()
         try:
-            with open(dest, "wb") as f:
-                remaining = length
-                while remaining > 0:
-                    chunk = self.rfile.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    received += len(chunk)
-                    remaining -= len(chunk)
+            with open(part, "wb") as f:
+                if chunked:
+                    received = self._read_chunked_body(f)
+                else:
+                    remaining = length
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        received += len(chunk)
+                        remaining -= len(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+
+            if not chunked and received != length:
+                raise IOError(f"收到的字节数不符：声明 {length} 字节，实际只收到 {received} 字节")
+            if received <= 0:
+                raise IOError("没有收到任何数据")
+
+            os.replace(part, dest)
             st = os.stat(dest)
+            cost = time.time() - started
+            speed = (st.st_size / cost / 1024 / 1024) if cost > 0 else 0
+            log(f"已接收 {os.path.basename(dest)}：{st.st_size} 字节，"
+                f"耗时 {cost:.1f}s（{speed:.1f} MB/s）"
+                + ("" if not size_hint or size_hint == st.st_size
+                   else f"；注意客户端声明的大小是 {size_hint}"))
             rec = {
                 "id": rid,
                 "name": os.path.basename(dest),
@@ -576,6 +706,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(200, {"ok": True, "saved": rec["name"],
                                          "size": st.st_size})
         except Exception as e:
+            # 半截文件必须删掉：留着会在下次启动被磁盘扫描当成「已接收」的正常文件。
+            try:
+                if os.path.exists(part):
+                    os.remove(part)
+            except Exception:
+                pass
+            log(f"接收失败 {safe}：{e}（已收到 {received} 字节"
+                + (f" / 声明 {length}" if not chunked else "") + "）")
             emit({"type": "upload_failed", "id": rid, "name": safe,
                   "error": str(e)})
             return self._send_json(500, {"ok": False, "error": str(e)})
@@ -685,6 +823,11 @@ def main():
             log(f"默认目录同样不可用：{e2}")
             fatal_dialog(f"接收目录无法创建：\n{CFG.get('transfer_dir')}\n\n{e2}")
             return
+
+    try:
+        cleanup_part_files()
+    except Exception as e:
+        log(f"清理未完成临时文件失败：{e}")
 
     try:
         refresh_records()

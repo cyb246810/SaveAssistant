@@ -96,20 +96,43 @@ function renderQueue() {
   const el = $("queue");
   const items = [...activeUploads.values()];
   if (!items.length) { el.innerHTML = '<div class="empty small">暂无传输</div>'; return; }
-  el.innerHTML = items.slice(0, 20).map((u) => `
+  el.innerHTML = items.slice(-20).reverse().map((u) => {
+    let status = "进行中…", cls = "";
+    if (u.done) {
+      cls = u.failed ? "failed" : "done";
+      status = u.failed ? "失败" : "已完成";
+    } else if (u.stale) {
+      status = "状态未知（连接已中断）";
+    }
+    const err = u.failed && u.error
+      ? `<div class="q-err" title="${esc(u.error)}">${esc(u.error)}</div>` : "";
+    return `
     <div class="q-item">
       <div class="q-row">
         <span class="tag ${u.category}">${esc(u.category_label)}</span>
         <span class="q-name" title="${esc(u.name)}">${esc(u.name)}</span>
         <span class="q-size">${u.size ? fmtSize(u.size) : ""}</span>
       </div>
-      <div class="q-status ${u.done ? "done" : ""}">${u.done ? (u.failed ? "失败" : "已完成") : "进行中…"}</div>
+      <div class="q-status ${cls}">${status}</div>
+      ${err}
       ${u.done ? "" : '<div class="prog"><div class="prog-fill"></div></div>'}
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 
 function connectSSE() {
   const es = new EventSource("/api/events");
+  // 服务端不会重放历史事件，所以连接（重新）建立时，页面里残留的「进行中…」
+  // 一定是上一次连接遗留下来的僵尸条目 —— 必须清掉，
+  // 否则关掉工作台再打开、或者服务重启之后，那条记录会一直卡在「进行中…」。
+  es.onopen = () => {
+    if (activeUploads.size) {
+      const stale = activeUploads.size;
+      activeUploads.clear();
+      renderQueue();
+      showToast(`已重置 ${stale} 条过期传输状态`, "info");
+    }
+  };
   es.onmessage = (e) => {
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     handleEvent(ev);
@@ -119,7 +142,8 @@ function handleEvent(ev) {
   switch (ev.type) {
     case "upload_started":
       activeUploads.set(ev.id, { id: ev.id, name: ev.name, category: ev.category,
-        category_label: ev.category_label, size: ev.size, done: false });
+        category_label: ev.category_label, size: ev.size, done: false,
+        t: Date.now() });
       renderQueue(); break;
     case "upload_completed": {
       const u = activeUploads.get(ev.id) || {};
@@ -129,7 +153,8 @@ function handleEvent(ev) {
     }
     case "upload_failed": {
       const f = activeUploads.get(ev.id) || {};
-      activeUploads.set(ev.id, { ...f, name: ev.name, done: true, failed: true });
+      activeUploads.set(ev.id, { ...f, name: ev.name, done: true, failed: true,
+        error: ev.error || "未知原因" });
       renderQueue(); break;
     }
     case "devices": devicesCache = ev.devices; renderDevices(); break;
@@ -202,10 +227,27 @@ $("btnChangeDir").onclick = async () => {
   showToast("接收目录已改为：" + data.transfer_dir, "success");
   loadConfig(); loadStatus(); loadFiles();
 };
+/**
+ * 把长时间没有终态事件的「进行中」标成「状态未知」。
+ * 手机端掉线/进程被杀时不会发出任何终态事件，那条记录会一直卡在「进行中…」，
+ * 让人误以为还在传。
+ */
+function markStaleUploads() {
+  const now = Date.now();
+  let changed = false;
+  activeUploads.forEach((u) => {
+    if (!u.done && !u.stale && u.t && now - u.t > 300000) {
+      u.stale = true;
+      changed = true;
+    }
+  });
+  if (changed) renderQueue();
+}
+
 $("btnOpenFolder").onclick = () => api("/api/open-folder");
 
 loadConfig();
 loadStatus();
 loadFiles();
 connectSSE();
-setInterval(() => { loadStatus(); loadFiles(); }, 5000);
+setInterval(() => { loadStatus(); loadFiles(); markStaleUploads(); }, 5000);

@@ -145,6 +145,9 @@ body {
 .q-size { font-size: 12px; color: var(--text-2); }
 .q-status { font-size: 11px; color: var(--text-2); margin-top: 6px; }
 .q-status.done { color: #34D399; }
+.q-status.failed { color: #E84A62; }
+.q-err { font-size: 11px; color: #E84A62; opacity: .85; margin-top: 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prog { height: 4px; background: var(--bg); border-radius: 999px; margin-top: 6px; overflow: hidden; }
 .prog-fill { height: 100%; width: 40%;
   background: linear-gradient(90deg, var(--primary), var(--cyan), var(--primary));
