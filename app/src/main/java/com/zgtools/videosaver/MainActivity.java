@@ -159,6 +159,15 @@ public class MainActivity extends Activity {
     private WifiManager.MulticastLock transferMulticastLock;
     private final List<TransferItem> transferItems = new ArrayList<>();
     private final ExecutorService transferExecutor = Executors.newSingleThreadExecutor();
+    /**
+     * 扫描可传输用的线程池：**刻意与 {@link #transferExecutor} 分开**。
+     * 传输是单线程串行队列，如果扫描排在同一条队列上，传输途中切页刷新
+     * 会被排在所有上传任务后面，看起来像「刷新没反应」。
+     */
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
+    /** 已有一次扫描在跑：切页/连点会重复触发，挡掉排队的那几次。 */
+    private final java.util.concurrent.atomic.AtomicBoolean scanRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private static final class TransferItem {
         final Uri uri;
@@ -817,34 +826,52 @@ public class MainActivity extends Activity {
         return Build.MODEL;
     }
 
+    /**
+     * 重新扫描可传输内容。
+     *
+     * 扫描要查三张表 + 逐条 open 校验，**不能放在主线程**（相册大时会卡住界面），
+     * 所以走 {@link #scanExecutor}，扫完回主线程渲染。
+     * 连点/切页会重复触发，用 {@link #scanRunning} 挡掉排队的那几次。
+     */
     private void refreshTransferList() {
         if (transferItems == null) return;
-        transferItems.clear();
-        transferExpanded = false;
-        String[] proj = {"_id", "display_name", "_size", "mime_type"};
-        collectMedia(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, proj, "video");
-        collectMedia(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, "image");
-        collectMedia(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, "audio");
-        if (transferItems.isEmpty()) {
-            // 兜底：应用自己的最近保存记录
-            ArrayList<RecentRecord> records = getValidRecentRecords();
-            for (RecentRecord r : records) {
-                if (r == null || TextUtils.isEmpty(r.uri)) continue;
-                String mime = r.mimeType == null ? "" : r.mimeType;
-                String cat = mime.startsWith("video") ? "video"
-                        : (mime.startsWith("audio") ? "audio" : "image");
-                transferItems.add(new TransferItem(Uri.parse(r.uri),
-                        ensureExtension(r.title, mime, cat), 0, cat));
+        if (!scanRunning.compareAndSet(false, true)) return;
+        scanExecutor.execute(new Runnable() {
+            @Override public void run() {
+                final ArrayList<TransferItem> scanned = new ArrayList<>();
+                String[] proj = {"_id", "display_name", "_size", "mime_type"};
+                collectMedia(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, proj, "video", scanned);
+                collectMedia(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, "image", scanned);
+                collectMedia(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, "audio", scanned);
+                if (scanned.isEmpty()) {
+                    // 兜底：应用自己的最近保存记录
+                    for (RecentRecord r : getValidRecentRecords()) {
+                        if (r == null || TextUtils.isEmpty(r.uri)) continue;
+                        String mime = r.mimeType == null ? "" : r.mimeType;
+                        String cat = mime.startsWith("video") ? "video"
+                                : (mime.startsWith("audio") ? "audio" : "image");
+                        scanned.add(new TransferItem(Uri.parse(r.uri),
+                                ensureExtension(r.title, mime, cat), 0, cat));
+                    }
+                }
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        scanRunning.set(false);
+                        transferItems.clear();
+                        transferItems.addAll(scanned);
+                        transferExpanded = false;
+                        renderTransferList();
+                    }
+                });
             }
-        }
-        renderTransferList();
+        });
     }
 
-    private void collectMedia(Uri base, String[] proj, String category) {
-        Cursor c = null;
+    private void collectMedia(Uri base, String[] proj, String category,
+                              ArrayList<TransferItem> out) {
+        Cursor c = queryMediaSafe(base, proj);
+        if (c == null) return;
         try {
-            c = getContentResolver().query(base, proj, null, null, "date_added DESC");
-            if (c == null) return;
             int idIdx = c.getColumnIndex("_id");
             int nameIdx = c.getColumnIndex("display_name");
             int sizeIdx = c.getColumnIndex("_size");
@@ -855,13 +882,72 @@ public class MainActivity extends Activity {
                 String name = nameIdx >= 0 ? c.getString(nameIdx) : ("media_" + id);
                 String mime = mimeIdx >= 0 ? c.getString(mimeIdx) : null;
                 long size = sizeIdx >= 0 ? c.getLong(sizeIdx) : 0;
-                transferItems.add(new TransferItem(u, ensureExtension(name, mime, category),
+                // 查得到不等于拿得到：MediaStore 偶尔留有「索引还在、文件已没了」的
+                // 僵尸条目（外部删除、SD 卡拔出、清理软件）。真去 open 一下确认，
+                // 免得用户等下点传输时才发现「文件已不存在」。
+                if (!mediaUriReadable(u)) continue;
+                out.add(new TransferItem(u, ensureExtension(name, mime, category),
                         size, category));
             }
         } catch (Exception e) {
             // 无媒体或无权限：忽略，走兜底
         } finally {
-            if (c != null) c.close();
+            c.close();
+        }
+    }
+
+    /**
+     * 带「剔除已删除 / 半成品」条件的媒体查询，**并在老设备上自动降级**。
+     *
+     * <p>要过滤掉两类不该出现在传输列表里的条目：
+     * <ul>
+     *   <li>{@code is_pending=1}：应用自己保存媒体时是「IS_PENDING=1 → 拷贝 → 0」，
+     *       半成品不能传；</li>
+     *   <li>{@code is_trashed=1}（API 30+）：进了「最近删除」的条目在 MediaStore 里
+     *       仍可查到，但用户以为已经删了，不该再出现在待传列表。</li>
+     * </ul>
+     *
+     * <p><b>为什么必须降级而不能只靠 try/catch</b>：{@code is_pending} 这个列在
+     * API 29 上**只加到了 Video / Images / Downloads 表，Audio 表并没有**。
+     * 如果把带 {@code is_pending=0} 的 selection 直接发给 Audio 表，
+     * 老设备会抛 {@code IllegalArgumentException: Invalid column is_pending} ——
+     * 而外层那个 {@code catch (Exception)} 会**把整个音频列表静默吃掉**，
+     * 表现为「音乐莫名不见了」，极难排查。所以这里失败就退回不带条件的查询，
+     * 宁可多列几条（后面还有 {@code mediaUriReadable} 兜底），也不能整类消失。
+     */
+    private Cursor queryMediaSafe(Uri base, String[] proj) {
+        String selection = MediaStore.MediaColumns.IS_PENDING + "=0";
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            selection += " AND " + MediaStore.MediaColumns.IS_TRASHED + "=0";
+        }
+        try {
+            Cursor c = getContentResolver().query(base, proj, selection, null,
+                    "date_added DESC");
+            if (c != null) return c;
+        } catch (Exception ignored) {
+            // 落到下面降级：这台设备/这张表不认这些列。
+        }
+        try {
+            return getContentResolver().query(base, proj, null, null, "date_added DESC");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 该媒体是否**真的读得到**（不只是索引里还在）。
+     *
+     * {@code openFileDescriptor} 是唯一可靠的判据：MediaStore 的查询结果可能来自
+     * 尚未刷新的索引，也可能文件已被外部删除 / 存储被卸载。
+     * 只对极少数条目失败，开销可以接受。
+     */
+    private boolean mediaUriReadable(Uri uri) {
+        if (uri == null) return false;
+        try (android.content.res.AssetFileDescriptor afd =
+                     getContentResolver().openAssetFileDescriptor(uri, "r")) {
+            return afd != null;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -1261,8 +1347,10 @@ public class MainActivity extends Activity {
         if (transfer) {
             applyPcConnectionUi();
             maybeAutoConnectPc();
+            // 每次进传输页都重新扫一遍：用户往往是在相册里删完东西才切过来的，
+            // 自动重扫能让列表与相册保持一致，不需要再手动点「刷新」。
+            refreshTransferList();
         }
-
         View target = transfer ? tabModeTransfer : tabModeSave;
         int w = target.getWidth();
         ViewGroup.LayoutParams lp = modeIndicator.getLayoutParams();
