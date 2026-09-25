@@ -16,7 +16,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.database.Cursor;
+import android.media.MediaCodec;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
+import android.media.MediaMuxer;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -70,7 +74,9 @@ import java.io.File;
 import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.FileInputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -173,12 +179,22 @@ public class MainActivity extends Activity {
     /** 折叠状态下渲染的条目数（其余收进「展开全部」）。 */
     private static final int TRANSFER_COLLAPSED_COUNT = 5;
     private boolean transferExpanded = false;
+    /** 传输列表的缩略图缓存：key 是媒体 Uri 字符串。 */
+    private final android.util.LruCache<String, Bitmap> transferThumbCache =
+            new android.util.LruCache<>(80);
+    /** 单张缩略图的像素边长（dp 转 px 后使用）。 */
+    private static final int TRANSFER_THUMB_DP = 48;
 
     private String currentVideoUrl = null;
     private String currentAwemeId = null;
     private String currentTitle = null;
     private String currentMusicUrl = null;
     private String currentMusicTitle = null;
+    /**
+     * 「仅保存音乐」当前的工作模式：true = 没有独立音乐资源（视频号），
+     * 需要先存原片再把音轨抽出来。
+     */
+    private boolean currentMusicViaExtraction = false;
     /** 当前解析结果是否来自微信视频号（视频号与抖音的 CDN、可用功能都不同）。 */
     private boolean currentIsChannels = false;
     private String currentChannelVideoUrl = null;
@@ -213,6 +229,36 @@ public class MainActivity extends Activity {
     private static final String RECENT_HISTORY_MIGRATED = "migrated_saved_media_v2_month";
     private static final long RECENT_HISTORY_RETENTION_MS = 30L * 24L * 60L * 60L * 1000L;
     private static final int RECENT_COLLAPSED_VISIBLE_COUNT = 2;
+
+    /**
+     * 记住电脑连接的偏好文件。
+     *
+     * 存两份：
+     * - {@link #PC_PREFS_LAST} 是「最后一次成功连接的地址」，**不因连接失败而清除** ——
+     *   每次开机都拿它去直连（先 ping 再 announce），命中就不用再广播搜索了；
+     * - 其余键是「最后一次搜索发现的候选列表」，只在**直连失败之后**当作备选挨个试。
+     *   之所以要分开存：手机换网后 IP 会变，但**广播搜索本身在部分路由器上会被拦**，
+     *   能把上次搜到的几个候选留着，就多一层不依赖广播的兜底。
+     */
+    private static final String PC_PREFS = "pc_connection_v1";
+    private static final String PC_PREFS_LAST = "last_addr";
+    /** 上一次搜索发现的候选地址，JSON 数组字符串，形如 ["192.168.1.20:18765", …]。 */
+    private static final String PC_PREFS_DISCOVERED = "discovered_addrs";
+    private static final String PC_PREFS_DISCOVERED_AT = "discovered_at";
+    /** 候选列表最多留几个：只作兜底，留太多会让「直连失败」后白等很久。 */
+    private static final int PC_DISCOVERED_MAX = 6;
+    /** 候选列表的保鲜期。太久之前的候选基本是换过网络的残留，试也是白试。 */
+    private static final long PC_DISCOVERED_TTL_MS = 30L * 24L * 60L * 60L * 1000L;
+
+    /** 自动连接互斥：传输页可能因切页/回前台被多次触发，只允许一次自动流程在跑。 */
+    private final java.util.concurrent.atomic.AtomicBoolean autoConnectRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /**
+     * 本次「进入传输页」是否已经跑过自动连接。
+     * 只在用户**主动点「连接」/「查找电脑」**时复位、或进程重启时复位；
+     * 刻意不在切页时复位 —— 否则来回切两次页就重复搜索了，正是用户不想要的。
+     */
+    private boolean autoConnectDoneThisSession = false;
 
     private static final class RecentRecord {
         final String mediaKey;
@@ -389,7 +435,11 @@ public class MainActivity extends Activity {
         });
 
         findViewById(R.id.btn_pc_find).setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { findPc(); }
+            @Override public void onClick(View v) {
+                // 用户主动要求重新找：清掉「本会话已自动连过」的标记，允许再搜索一轮。
+                autoConnectDoneThisSession = true;
+                findPc();
+            }
         });
         findViewById(R.id.btn_pc_connect).setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
@@ -414,49 +464,240 @@ public class MainActivity extends Activity {
         });
     }
 
-    /** UDP 广播查找电脑，找到后自动连接。 */
+    /** UDP 广播查找电脑，找到后自动连接。用户手动点「查找电脑」走这条。 */
     private void findPc() {
-        tvPcStatus.setText(R.string.transfer_connecting);
-        transferExecutor.execute(new Runnable() {
+        startPcConnect(false);
+    }
+
+    /**
+     * 进入传输页时的自动连接：**先用上次的地址直连，直连不成才去搜**。
+     *
+     * 顺序刻意如此 —— 广播搜索要等 2.8 秒（多网卡还要多等），而查 IP 缓存是零成本的：
+     * 家里/公司的 WiFi 一个月也不会变一次 IP，绝大多数情况下用户根本没有等待感。
+     * 只有确实连不上（换网、电脑重启换了 IP、电脑没开）才退化成搜索。
+     */
+    private void autoConnectPc() {
+        startPcConnect(true);
+    }
+
+    /**
+     * 电脑连接的统一入口。
+     *
+     * @param auto true = 进入传输页自动触发；false = 用户手动点「查找电脑」。
+     */
+    private void startPcConnect(final boolean auto) {
+        if (pcConnected) return;                       // 已经连着，不折腾
+        if (!autoConnectRunning.compareAndSet(false, true)) return;  // 已有一次在跑
+
+        tvPcStatus.setText(auto ? R.string.transfer_auto_connecting
+                : R.string.transfer_connecting);
+        // 自动流程期间把「查找 / 连接」按钮禁掉，避免用户等不及手动再点一次、
+        // 两个流程抢同一个单线程 executor 反而更慢。
+        setPcConnectButtonsEnabled(false);
+
+                transferExecutor.execute(new Runnable() {
             @Override public void run() {
-                WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-                WifiManager.MulticastLock lock = null;
+                String result = null;   // null = 成功；否则是失败原因
+                boolean connected = false;
                 try {
-                    if (wifi != null) {
-                        lock = wifi.createMulticastLock("SaveAssistantDiscovery");
-                        lock.setReferenceCounted(false);
-                        lock.acquire();
+                    if (auto) {
+                        result = tryCachedAddresses();
+                        if (result == null) { connected = true; return; }
                     }
-                    final java.util.List<String[]> found = PcTransferClient.discover(pcPort, 2800);
+                    result = doDiscoverAndConnect(auto);
+                    connected = (result == null);
+                } finally {
+                    final String finalResult = result;
+                    final boolean finalConnected = connected;
+                    autoConnectRunning.set(false);
                     runOnUiThread(new Runnable() {
                         @Override public void run() {
-                            if (found == null || found.isEmpty()) {
-                                tvPcStatus.setText("未发现电脑，请检查电脑端已启动、地址正确，且手机与电脑允许互相访问");
-                                return;
+                            setPcConnectButtonsEnabled(true);
+                            if (finalResult != null) {
+                                tvPcStatus.setText(getString(
+                                        R.string.transfer_connect_failed_fmt, finalResult));
+                                applyPcConnectionUi();
+                            } else if (!finalConnected) {
+                                // 自动模式下没搜到电脑：**必须把「正在自动连接…」这句话收掉**，
+                                // 否则它会一直挂在那里，看起来像卡死了。
+                                // 这里刻意不用红色报错——电脑没开机是很常见的情况，
+                                // 把输入区展开让用户自己填地址就够了。
+                                tvPcStatus.setText(R.string.transfer_auto_idle);
+                                applyPcConnectionUi();
                             }
-                            String[] first = found.get(0);
-                            String label = (first[1] == null || first[1].isEmpty()) ? first[0] : first[1];
-                            etPcAddr.setText(first[0] + ":" + pcPort);
-                            tvPcStatus.setText(getString(R.string.transfer_found_fmt, label + "（" + first[0] + "）"));
-                            connectPc(first[0] + ":" + pcPort);
                         }
                     });
-                } finally {
-                    if (lock != null && lock.isHeld()) {
-                        lock.release();
-                    }
                 }
             }
         });
     }
 
-    /** 按 "IP" 或 "IP:端口" 连接电脑并联调配对。 */
+    /**
+     * 按「上次成功的地址 → 上次搜索到的候选」依次试探。
+     *
+     * @return null 表示某个地址连通并已自报家门；否则返回最后一条失败原因。
+     */
+    private String tryCachedAddresses() {
+        final java.util.List<String> candidates = new ArrayList<>();
+        SharedPreferences prefs = getSharedPreferences(PC_PREFS, MODE_PRIVATE);
+        String last = prefs.getString(PC_PREFS_LAST, "");
+        if (last != null && !last.trim().isEmpty()) {
+            candidates.add(last.trim());
+        }
+        for (String addr : readDiscoveredAddrs(prefs)) {
+            if (!candidates.contains(addr)) {
+                candidates.add(addr);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return "没有可用的历史地址";   // 首次使用：直接走搜索
+        }
+
+        String lastError = null;
+        for (final String addr : candidates) {
+            final String[] hp = parseHostPort(addr);
+            if (hp[0].isEmpty()) continue;
+            try {
+                final int parsedPort = Integer.parseInt(hp[1]);
+                PcTransferClient.ping(hp[0], parsedPort, 2000);
+                final PcTransferClient.PcInfo info = PcTransferClient.announce(
+                        hp[0], parsedPort, Build.MODEL, Build.MANUFACTURER,
+                        localIpForDisplay(), 3000);
+                final String host = hp[0];
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        etPcAddr.setText(host + ":" + parsedPort);
+                        markPcConnected(host, parsedPort, info);
+                    }
+                });
+                return null;
+            } catch (Exception e) {
+                lastError = PcTransferClient.friendlyError(e);
+            }
+        }
+        return lastError;
+    }
+
+    /**
+     * 广播搜索并连接第一个应答的电脑。
+     *
+     * @return null 表示成功（或在自动模式下「搜不到」已被当作正常结果，静默留着输入区）；
+     *         否则返回要展示的失败原因。
+     */
+    private String doDiscoverAndConnect(final boolean auto) {
+        WifiManager wifi = (WifiManager) getApplicationContext()
+                .getSystemService(Context.WIFI_SERVICE);
+        WifiManager.MulticastLock lock = null;
+        try {
+            if (wifi != null) {
+                lock = wifi.createMulticastLock("SaveAssistantDiscovery");
+                lock.setReferenceCounted(false);
+                lock.acquire();
+            }
+            final java.util.List<String[]> found = PcTransferClient.discover(pcPort, 2800);
+            if (found == null || found.isEmpty()) {
+                // 自动模式下搜不到电脑是**很常见**的（电脑没开机 / 不在同一 WiFi），
+                // 这时保持输入区展开让用户能手动填地址就够了，不需要红字报错吓人。
+                return auto ? null : getString(R.string.transfer_not_found);
+            }
+            final String[] first = found.get(0);
+            final String label = (first[1] == null || first[1].isEmpty()) ? first[0] : first[1];
+            final String host = first[0];
+            final int port = pcPort;
+            try {
+                PcTransferClient.ping(host, port, 3000);
+                final PcTransferClient.PcInfo info = PcTransferClient.announce(
+                        host, port, Build.MODEL, Build.MANUFACTURER, localIpForDisplay(), 3000);
+                saveDiscoveredAddrs(found, port);
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        etPcAddr.setText(host + ":" + port);
+                        tvPcStatus.setText(getString(R.string.transfer_found_fmt,
+                                label + "（" + host + "）"));
+                        markPcConnected(host, port, info);
+                    }
+                });
+                return null;
+            } catch (Exception e) {
+                return PcTransferClient.friendlyError(e);
+            }
+        } finally {
+            if (lock != null && lock.isHeld()) {
+                lock.release();
+            }
+        }
+    }
+
+    /** 连接成功后的统一收尾：记状态、记地址、收起连接区、拉可传输列表。 */
+    private void markPcConnected(String host, int port, PcTransferClient.PcInfo info) {
+        pcHost = host;
+        pcPort = port;
+        pcConnected = true;
+        autoConnectDoneThisSession = true;
+        String label = (info == null || info.deviceName.isEmpty()) ? host : info.deviceName;
+        tvPcStatus.setText(getString(R.string.transfer_connected_fmt,
+                label + "（" + host + "）"));
+        applyPcConnectionUi();
+        // 只记「连成功过」的地址 —— 记下连不上的地址，下次开机白等一轮超时。
+        getSharedPreferences(PC_PREFS, MODE_PRIVATE).edit()
+                .putString(PC_PREFS_LAST, host + ":" + port)
+                .apply();
+        refreshTransferList();
+    }
+
+    /** 广播搜索到的候选列表落盘（作直连失败后的备选）。 */
+    private void saveDiscoveredAddrs(java.util.List<String[]> found, int port) {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        int n = 0;
+        for (String[] item : found) {
+            if (item == null || item.length == 0 || item[0] == null || item[0].isEmpty()) continue;
+            if (n++ >= PC_DISCOVERED_MAX) break;
+            arr.put(item[0] + ":" + port);
+        }
+        if (arr.length() == 0) return;
+        getSharedPreferences(PC_PREFS, MODE_PRIVATE).edit()
+                .putString(PC_PREFS_DISCOVERED, arr.toString())
+                .putLong(PC_PREFS_DISCOVERED_AT, System.currentTimeMillis())
+                .apply();
+    }
+
+    /** 读取候选列表；过期（超过 {@link #PC_DISCOVERED_TTL_MS}）就当作没有。 */
+    private List<String> readDiscoveredAddrs(SharedPreferences prefs) {
+        List<String> out = new ArrayList<>();
+        long at = prefs.getLong(PC_PREFS_DISCOVERED_AT, 0L);
+        if (at <= 0 || System.currentTimeMillis() - at > PC_DISCOVERED_TTL_MS) {
+            return out;
+        }
+        String raw = prefs.getString(PC_PREFS_DISCOVERED, "");
+        if (raw == null || raw.trim().isEmpty()) return out;
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(raw);
+            for (int i = 0; i < arr.length(); i++) {
+                String s = arr.optString(i, "").trim();
+                if (!s.isEmpty() && !out.contains(s)) out.add(s);
+            }
+        } catch (Exception ignored) {
+            // 存坏了就当没有，不该因为一条脏缓存让自动连接整个失效。
+        }
+        return out;
+    }
+
+    /** 自动连接流程进行中禁用两个按钮，防止用户重复触发。 */
+    private void setPcConnectButtonsEnabled(boolean enabled) {
+        View find = findViewById(R.id.btn_pc_find);
+        View connect = findViewById(R.id.btn_pc_connect);
+        if (find != null) find.setEnabled(enabled);
+        if (connect != null) connect.setEnabled(enabled);
+    }
+
+    /** 按 "IP" 或 "IP:端口" 连接电脑并联调配对。用户手动点「连接」走这条。 */
     private void connectPc(final String addr) {
         final String cleaned = addr == null ? "" : addr.trim();
         if (cleaned.isEmpty()) {
             tvPcStatus.setText(R.string.transfer_not_found);
             return;
         }
+        autoConnectDoneThisSession = true;   // 用户自己出手了，别再自动跑一遍
         tvPcStatus.setText(R.string.transfer_connecting);
         transferExecutor.execute(new Runnable() {
             @Override public void run() {
@@ -474,16 +715,11 @@ public class MainActivity extends Activity {
                     final PcTransferClient.PcInfo info = PcTransferClient.announce(
                             hp[0], parsedPort, Build.MODEL,
                             Build.MANUFACTURER, localIpForDisplay(), 4000);
+                    final int port = parsedPort;
+                    final String host = hp[0];
                     runOnUiThread(new Runnable() {
                         @Override public void run() {
-                            pcHost = hp[0];
-                            pcPort = parsedPort;
-                            pcConnected = true;
-                            String label = info.deviceName.isEmpty() ? hp[0] : info.deviceName;
-                            tvPcStatus.setText(getString(R.string.transfer_connected_fmt,
-                                    label + "（" + hp[0] + "）"));
-                            applyPcConnectionUi();
-                            refreshTransferList();
+                            markPcConnected(host, port, info);
                         }
                     });
                 } catch (final Exception e) {
@@ -491,13 +727,43 @@ public class MainActivity extends Activity {
                         @Override public void run() {
                             pcConnected = false;
                             tvPcStatus.setText(getString(R.string.transfer_connect_failed_fmt,
-                                    String.valueOf(e.getMessage())));
+                                    PcTransferClient.friendlyError(e)));
                             applyPcConnectionUi();
                         }
                     });
                 }
             }
         });
+    }
+
+    /** 自动连接已排队未执行：防重入（页面连点、onResume 与切页同时触发）。 */
+    private boolean autoConnectingPc = false;
+
+    /**
+     * 进入传输页时自动连接电脑（用上次的地址直连，连不上才搜索）。
+     *
+     * 只在**本次进入应用后第一次**进入传输页时跑；连上之后就一直复用那条连接，
+     * 除非中途断开（那时 {@code pcConnected} 会被置假，下次进页面会自动重来一轮）。
+     * 用户也可以随时手动点「查找电脑」强制重新搜索。
+     */
+    private void maybeAutoConnectPc() {
+        if (pcConnected) return;
+        if (autoConnectDoneThisSession) return;
+        if (autoConnectRunning.get()) return;
+        if (autoConnectingPc) return;
+        if (etPcAddr == null || tvPcStatus == null) return;
+        autoConnectDoneThisSession = true;
+        autoConnectingPc = true;
+        // 等布局与「最近保存」的扫描先落地：刚进应用时后台正在扫相册，
+        // 这时抢网会跟扫描抢 IO，反而让「已连接」来得更慢。
+        tvPcStatus.postDelayed(new Runnable() {
+            @Override public void run() {
+                autoConnectingPc = false;
+                if (transferMode && !pcConnected) {
+                    autoConnectPc();
+                }
+            }
+        }, 260L);
     }
 
     /**
@@ -661,21 +927,61 @@ public class MainActivity extends Activity {
 
         for (int i = 0; i < visibleCount; i++) {
             final TransferItem item = transferItems.get(i);
-            CheckBox cb = new CheckBox(this);
-            String label = item.name;
-            if (item.size > 0) label = label + "  ·  " + fmtSize(item.size);
-            cb.setText(label);
-            cb.setTextSize(13);
-            cb.setTextColor(getColor(R.color.text_primary));
-            cb.setButtonTintList(android.content.res.ColorStateList.valueOf(getColor(R.color.primary)));
+
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(2), dp(6), dp(2), dp(6));
+
+            final CheckBox cb = new CheckBox(this);
+            cb.setButtonTintList(
+                    android.content.res.ColorStateList.valueOf(getColor(R.color.primary)));
             cb.setChecked(item.checked);
-            cb.setPadding(dp(2), dp(6), dp(2), dp(6));
+            cb.setPadding(0, 0, 0, 0);
+            row.addView(cb, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            ImageView thumb = new ImageView(this);
+            int thumbPx = dp(TRANSFER_THUMB_DP);
+            LinearLayout.LayoutParams thumbLp =
+                    new LinearLayout.LayoutParams(thumbPx, thumbPx);
+            thumbLp.setMargins(dp(2), 0, dp(10), 0);
+            thumb.setLayoutParams(thumbLp);
+            thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            bindTransferThumb(thumb, item);
+            row.addView(thumb);
+
+            LinearLayout texts = new LinearLayout(this);
+            texts.setOrientation(LinearLayout.VERTICAL);
+            TextView name = new TextView(this);
+            name.setText(item.name);
+            name.setTextSize(13);
+            name.setTextColor(getColor(R.color.text_primary));
+            name.setSingleLine(true);
+            name.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+            texts.addView(name);
+            if (item.size > 0) {
+                TextView sub = new TextView(this);
+                sub.setText(fmtSize(item.size));
+                sub.setTextSize(11);
+                sub.setTextColor(getColor(R.color.text_secondary));
+                texts.addView(sub);
+            }
+            row.addView(texts, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            // 点整行也能勾选：行比复选框大，手指不容易点空
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    cb.setChecked(!cb.isChecked());
+                }
+            });
             cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
                 @Override public void onCheckedChanged(CompoundButton b, boolean v) {
                     item.checked = v;
                 }
             });
-            transferList.addView(cb);
+            transferList.addView(row);
         }
 
         if (total > TRANSFER_COLLAPSED_COUNT) {
@@ -686,6 +992,68 @@ public class MainActivity extends Activity {
         } else {
             btnTransferExpand.setVisibility(View.GONE);
         }
+    }
+
+    /**
+     * 给一行的缩略图占位并异步加载。
+     *
+     * <p>用系统的 {@code loadThumbnail} 而不是自己解码原图：视频首帧由 MediaStore 缓存，
+     * 又快又不占内存。加载放在 previewExecutor 上，回来时确认那一行还在展示同一个文件才贴图，
+     * 避免列表滚动/重建后贴错行。
+     */
+    private void bindTransferThumb(final ImageView view, final TransferItem item) {
+        final String key = item.uri.toString();
+        Bitmap cached = transferThumbCache.get(key);
+        if (cached != null) {
+            view.setImageBitmap(cached);
+            return;
+        }
+        view.setImageDrawable(transferThumbPlaceholder(item.category));
+        view.setTag(key);
+        final int px = dp(TRANSFER_THUMB_DP);
+        previewExecutor.execute(new Runnable() {
+            @Override public void run() {
+                Bitmap bmp;
+                try {
+                    bmp = getContentResolver().loadThumbnail(item.uri,
+                            new Size(px, px), null);
+                } catch (Exception e) {
+                    bmp = null;   // 音频没有缩略图，或文件已被删除
+                }
+                if (bmp == null) return;
+                transferThumbCache.put(key, bmp);
+                final Bitmap result = bmp;
+                runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        if (key.equals(view.getTag())) {
+                            view.setImageBitmap(result);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /** 拿不到缩略图时的占位底色（按类别区分，避免一片死灰）。 */
+    private android.graphics.drawable.Drawable transferThumbPlaceholder(String category) {
+        GradientDrawable d = new GradientDrawable();
+        d.setCornerRadius(dp(6));
+        int color;
+        switch (category == null ? "" : category) {
+            case "video":
+                color = 0xFF2C1A20;
+                break;
+            case "image":
+                color = 0xFF1A2430;
+                break;
+            case "audio":
+                color = 0xFF182A26;
+                break;
+            default:
+                color = 0xFF24262B;
+        }
+        d.setColor(color);
+        return d;
     }
 
     private void setAllTransferChecked(boolean checked) {
@@ -715,7 +1083,12 @@ public class MainActivity extends Activity {
             @Override public void run() {
                 int ok = 0;
                 int fail = 0;
+                int skipped = 0;
                 final int total = selected.size();
+                // 用数组当可变容器，方便在匿名内部类里读取（lambda/内部类要求 final）
+                final String[] firstError = new String[1];
+                // 传输过程中才发现已被删除的条目，结束后从列表里摘掉
+                final List<TransferItem> goneItems = new ArrayList<>();
                 for (int i = 0; i < total; i++) {
                     final TransferItem item = selected.get(i);
                     final int ordinal = i + 1;
@@ -733,24 +1106,57 @@ public class MainActivity extends Activity {
                             item.size = size;
                         }
                         final long totalBytes = size;
-                        in = getContentResolver().openInputStream(item.uri);
-                        if (in == null) throw new Exception("无法读取文件");
-                        PcTransferClient.upload(pcHost, pcPort, in, size, item.name,
-                                item.category, Build.MODEL, 6000, 120000,
-                                new PcTransferClient.Progress() {
-                                    @Override public void onProgress(long sent, long all) {
-                                        final int pct = totalBytes > 0
-                                                ? (int) (sent * 100 / totalBytes) : 0;
-                                        runOnUiThread(new Runnable() {
-                                            @Override public void run() {
-                                                transferProgressBar.setProgress(pct);
-                                            }
-                                        });
+                        final PcTransferClient.Progress progress = new PcTransferClient.Progress() {
+                            @Override public void onProgress(long sent, long all) {
+                                final int pct = totalBytes > 0
+                                        ? (int) (sent * 100 / totalBytes) : 0;
+                                runOnUiThread(new Runnable() {
+                                    @Override public void run() {
+                                        transferProgressBar.setProgress(pct);
                                     }
                                 });
+                            }
+                        };
+                        // 大文件对网络抖动特别敏感，失败自动重开输入流重试一次。
+                        // 注意每次重试都必须重新 openInputStream：流已经被读过一截，回不去。
+                        final int maxAttempts = 2;
+                        for (int attempt = 1; ; attempt++) {
+                            if (in != null) {
+                                try { in.close(); } catch (Exception ignored) { }
+                                in = null;
+                            }
+                            in = getContentResolver().openInputStream(item.uri);
+                            if (in == null) throw new Exception("无法读取文件");
+                            try {
+                                PcTransferClient.upload(pcHost, pcPort, in, size, item.name,
+                                        item.category, Build.MODEL, 8000, 600000, progress);
+                                break;
+                            } catch (Exception uploadError) {
+                                if (attempt >= maxAttempts) throw uploadError;
+                                runOnUiThread(new Runnable() {
+                                    @Override public void run() {
+                                        transferProgressBar.setProgress(0);
+                                        tvTransferProgress.setText(getString(
+                                                R.string.transfer_retrying_fmt, item.name));
+                                    }
+                                });
+                            }
+                        }
                         ok++;
                     } catch (Exception e) {
-                        fail++;
+                        // 文件在相册里被删了：这不算「传输失败」，而是这条记录已经作废。
+                        // 直接从列表移除并计入「跳过」，免得用户反复看到同一个不存在的文件。
+                        if (!mediaUriExists(item.uri)) {
+                            skipped++;
+                            goneItems.add(item);
+                        } else {
+                            fail++;
+                            // 以前这里把异常整个吞掉，用户只看得到「失败 1 个」却不知道原因，
+                            // 结果就是谁也没法定位。现在把第一条失败原因留下来显示。
+                            if (firstError[0] == null) {
+                                firstError[0] = PcTransferClient.friendlyError(e);
+                            }
+                        }
                     } finally {
                         if (in != null) {
                             try { in.close(); } catch (Exception ignored) { }
@@ -759,6 +1165,8 @@ public class MainActivity extends Activity {
                 }
                 final int okFinal = ok;
                 final int failFinal = fail;
+                final int skippedFinal = skipped;
+                final String errFinal = firstError[0];
                 // 有失败时确认电脑是否还在线：真断了就把连接区放回来，让用户重连
                 boolean lost = false;
                 if (fail > 0 && pcHost != null) {
@@ -778,7 +1186,19 @@ public class MainActivity extends Activity {
                             tvPcStatus.setText(R.string.transfer_disconnected);
                         }
                         applyPcConnectionUi();
+                        // 已删除的条目直接摘掉，下一次打开列表不会还挂着
+                        if (!goneItems.isEmpty()) {
+                            transferItems.removeAll(goneItems);
+                            renderTransferList();
+                        }
                         String msg = getString(R.string.transfer_all_done_fmt, okFinal, failFinal);
+                        if (skippedFinal > 0) {
+                            msg = msg + "\n" + getString(R.string.transfer_skipped_gone_fmt,
+                                    skippedFinal);
+                        }
+                        if (failFinal > 0 && errFinal != null) {
+                            msg = msg + "\n" + getString(R.string.transfer_first_error_fmt, errFinal);
+                        }
                         tvTransferProgress.setText(msg);
                         Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
                     }
@@ -840,6 +1260,7 @@ public class MainActivity extends Activity {
         // 切到传输页时同步一次连接区显隐（已连接就只留状态小字）
         if (transfer) {
             applyPcConnectionUi();
+            maybeAutoConnectPc();
         }
 
         View target = transfer ? tabModeTransfer : tabModeSave;
@@ -959,6 +1380,7 @@ public class MainActivity extends Activity {
         currentTitle = null;
         currentMusicUrl = null;
         currentMusicTitle = null;
+        currentMusicViaExtraction = false;
         currentChannelVideoUrl = null;
         currentCoverUrl = null;
         currentChannelAuthor = null;
@@ -1002,12 +1424,20 @@ public class MainActivity extends Activity {
                 if (!TextUtils.isEmpty(shortTitle)) showBurnTitleOption();
                 if (!TextUtils.isEmpty(result.coverUrl)) showApplyCoverOption();
                 showDownloadButtonAnimated();
-                // 视频号没有独立音乐资源、单条作品也无需拼接，所以这两项始终不出现
+                // 视频号没有独立音乐资源（音频只存在于视频轨里），单条作品也无需拼接：
+                // 拼接按钮始终不出现；但「仅保存音乐」照给——走「存原片 → 抽出音轨」这条路，
+                // 抽出来的就是原音轨本身，不重编码，与视频里那条一模一样。
                 hideStitchButton();
-                hideSaveMusicButton();
+                if (!TextUtils.isEmpty(result.videoUrl)) {
+                    currentMusicViaExtraction = true;
+                    currentMusicTitle = shortTitle;
+                    showSaveMusicButtonAnimated();
+                } else {
+                    hideSaveMusicButton();
+                }
 
                 String message = "视频号解析成功！" + (TextUtils.isEmpty(result.author)
-                        ? "" : "@" + result.author + " ") + "可保存原片";
+                        ? "" : "@" + result.author + " ") + "可保存原片，也可仅保存音乐";
                 setStatus(message, R.color.color_success);
                 Toast.makeText(MainActivity.this, "视频号解析成功", Toast.LENGTH_SHORT).show();
             }
@@ -1102,6 +1532,7 @@ public class MainActivity extends Activity {
         currentTitle = null;
         currentMusicUrl = null;
         currentMusicTitle = null;
+        currentMusicViaExtraction = false;
         currentIsChannels = false;
         currentChannelVideoUrl = null;
         currentCoverUrl = null;
@@ -1121,6 +1552,25 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        // 用户很可能是在相册里直接删掉作品的。回到应用时重新校验一遍记录：
+        // getValidRecentRecords() 会比对相册、把失效的记录与防重复标记一起清掉，
+        // 然后刷新「最近保存」与「可传输内容」——这样记录会跟着相册同步消失，
+        // 传输时也就不会再撞见「文件已不存在」。
+        previewExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                getValidRecentRecords();
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        renderRecentHistory();
+                        if (transferMode) {
+                            refreshTransferList();
+                        }
+                    }
+                });
+            }
+        });
         // Android 10+ 只允许前台应用读取剪贴板。稍等界面进入前台后再读取，
         // 同时也覆盖从抖音复制链接后切回本应用的场景。
         if (etLink != null) {
@@ -1190,6 +1640,7 @@ public class MainActivity extends Activity {
         currentTitle = null;
         currentMusicUrl = null;
         currentMusicTitle = null;
+        currentMusicViaExtraction = false;
         clearPhotoSelection();
         hideStitchButton();
         hideSaveMusicButton();
@@ -3929,14 +4380,197 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 保存作品的完整音乐。
-     * <p>
-     * 关键设计：**直接下载抖音 CDN 上的原始音乐文件并原样落盘，不做任何重编码**，
-     * 因此得到的就是源文件本身，不存在代际损失（这是能做到的“最保真”）。
-     * 文件格式、扩展名与 MIME 通过文件头字节判定，不靠 URL 猜。
-     * 标题用解析到的原音乐名（musicTitle）。
+     * 视频号专用：没有独立音乐地址时，先存原片再把音轨抽出来。
+     *
+     * <p>刻意**复用「保存视频」那条已验证的链路**（{@link #saveVideoToGallery} + 平台分发下载），
+     * 而不是另写一套网络代码——视频号的 CDN 白名单、Referer、重定向都已在那边处理妥当。
+     * 抽完音轨后，视频原片按用户自己的选择保留或删除（弹窗里选），不作主张。
+     */
+    private void extractMusicFromCurrentVideo() {
+        final String videoUrl = TextUtils.isEmpty(currentChannelVideoUrl)
+                ? currentVideoUrl : currentChannelVideoUrl;
+        if (TextUtils.isEmpty(videoUrl)) {
+            Toast.makeText(this, R.string.music_none, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // 同一个作品抽出来的音乐是同一份，用视频地址做去重键
+        final String mediaKey = buildMediaKey(currentAwemeId, "music_extract", 0, videoUrl);
+        if (getSavedMediaUri(mediaKey) != null) {
+            setStatus(getString(R.string.music_duplicate), R.color.color_success);
+            Toast.makeText(this, R.string.music_duplicate, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        final String rawTitle = TextUtils.isEmpty(currentMusicTitle)
+                ? currentTitle : currentMusicTitle;
+        final String musicTitle = TextUtils.isEmpty(rawTitle)
+                ? getString(R.string.music_unknown_title) : rawTitle;
+
+        setDownloadControlsEnabled(false);
+        isDownloading = true;
+        progressBar.setVisibility(View.VISIBLE);
+        progressBar.setProgress(0);
+        setStatus("正在保存原片… 0%", R.color.text_secondary);
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final File workDir = new File(getCacheDir(),
+                        "music_extract_" + System.currentTimeMillis());
+                Uri videoUri = null;
+                File audio = null;
+                long durationUs = 0L;
+                try {
+                    if (!workDir.mkdirs() && !workDir.isDirectory()) {
+                        throw new Exception("无法创建缓存目录");
+                    }
+                    // 第一步：把原片拿到手（复用已在用的平台下载链路）
+                    videoUri = saveVideoToGallery(videoUrl, musicTitle, "_原片",
+                            new DouyinParser.DownloadCallback() {
+                                @Override
+                                public void onProgress(final int percent) {
+                                    runOnUiThread(new Runnable() {
+                                        @Override public void run() {
+                                            progressBar.setProgress(percent);
+                                            setStatus("正在保存原片… " + percent + "%",
+                                                    R.color.text_secondary);
+                                        }
+                                    });
+                                }
+
+                                @Override public void onSuccess(String filePath) { }
+                                @Override public void onError(String message) { }
+                            });
+
+                    // 第二步：把音轨原样抽出来（不重编码）
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            progressBar.setProgress(100);
+                            setStatus("正在提取音轨（不重编码）…", R.color.text_secondary);
+                        }
+                    });
+                    audio = extractAudioFromVideoUri(videoUri, workDir);
+                    durationUs = readAudioDurationUs(audio);
+                    final String[] format = resolveAudioFormat(audio, null);
+                    final long bitrate = readAudioBitrate(audio);
+                    final long durationMs = durationUs > 0L ? durationUs / 1000L
+                            : readAudioDurationMs(audio);
+
+                    final Uri audioUri = insertAudioIntoLibrary(audio, musicTitle,
+                            format[0], format[1], "正在写入音乐库");
+                    markMediaSaved(mediaKey, audioUri);
+                    recordRecentSave(mediaKey, audioUri, musicTitle, "音乐", format[1]);
+
+                    final Uri savedVideo = videoUri;
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            setDownloadControlsEnabled(true);
+                            isDownloading = false;
+                            progressBar.setVisibility(View.GONE);
+
+                            String duration = formatDuration(durationMs);
+                            StringBuilder quality = new StringBuilder();
+                            quality.append(format[0].toUpperCase(Locale.ROOT));
+                            if (bitrate > 0) {
+                                quality.append(" · ").append(bitrate / 1000L).append(" kbps");
+                            }
+                            quality.append(" · 从视频原音轨直提，未重编码");
+
+                            String message = "已保存《" + musicTitle + "》"
+                                    + (duration.isEmpty() ? "" : "（" + duration + "）")
+                                    + "：" + quality + "；" + getString(R.string.music_extract_note);
+                            setStatus(message + "  ·  已存入音乐库「" + ALBUM_DIR + "」",
+                                    R.color.color_success);
+                            Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                            askKeepExtractedVideo(savedVideo, musicTitle);
+                        }
+                    });
+                } catch (final Exception e) {
+                    // 提取失败时不留半成品：把刚存下的原片也撤掉，避免相册里多出无意义的文件
+                    if (videoUri != null) {
+                        try { getContentResolver().delete(videoUri, null, null); }
+                        catch (Exception ignored) { }
+                    }
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            setDownloadControlsEnabled(true);
+                            isDownloading = false;
+                            progressBar.setVisibility(View.GONE);
+                            String reason = e.getMessage() == null ? "未知原因" : e.getMessage();
+                            // 视频安静音是常见情况，把原因说清楚，别让人以为是软件坏了
+                            setStatus("音乐提取失败：" + reason, R.color.color_error);
+                            Toast.makeText(MainActivity.this,
+                                    "音乐提取失败：" + reason, Toast.LENGTH_LONG).show();
+                        }
+                    });
+                } finally {
+                    deleteRecursively(workDir);
+                }
+            }
+        }).start();
+    }
+
+    /** 抽完音轨后问一句原片留不留——默认留下，因为用户可能本来也想存这条作品。 */
+    private void askKeepExtractedVideo(final Uri videoUri, final String musicTitle) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.music_extract_done_title)
+                .setMessage(getString(R.string.music_extract_keep_msg, musicTitle))
+                .setPositiveButton(R.string.music_extract_keep, null)
+                .setNegativeButton(R.string.music_extract_delete, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        try {
+                            getContentResolver().delete(videoUri, null, null);
+                            Toast.makeText(MainActivity.this,
+                                    R.string.music_extract_deleted, Toast.LENGTH_SHORT).show();
+                        } catch (Exception e) {
+                            Toast.makeText(MainActivity.this,
+                                    "删除原片失败，可在相册里手动删除", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                })
+                .show();
+    }
+
+    /** 读音频时长（微秒），用于从容器里确认抽出的音轨是完整的。 */
+    private static long readAudioDurationUs(File file) {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(file.getAbsolutePath());
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat format = extractor.getTrackFormat(i);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("audio/")
+                        && format.containsKey(MediaFormat.KEY_DURATION)) {
+                    return format.getLong(MediaFormat.KEY_DURATION);
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) { }
+        }
+        return 0L;
+    }
+
+    /**
+     * 「仅保存音乐」——一个按钮，两条路，对抖音与微信视频号都成立。
+     *
+     * <p><b>抖音</b>：作品用的那首曲子有独立音频地址，直接下 CDN 上的原始音乐文件并原样落盘，
+     * 不做任何重编码，拿到的就是源文件本身。
+     *
+     * <p><b>微信视频号</b>：平台不提供独立音乐资源（音频只存在于视频轨里），
+     * 于是先把原片存进相册，再用 {@link MediaExtractor}+{@link MediaMuxer} 把音轨
+     * **原样抽出来**封装成 .m4a —— 同样不解码、不重编码，抽出来就是视频里那条音轨本身。
+     *
+     * <p>两条路的文件格式、扩展名与 MIME 一律靠文件头字节判定，不猜 URL。
      */
     private void downloadMusic() {
+        if (currentMusicViaExtraction) {
+            extractMusicFromCurrentVideo();
+            return;
+        }
         final String musicUrl = currentMusicUrl;
         if (TextUtils.isEmpty(musicUrl)) {
             Toast.makeText(this, R.string.music_none, Toast.LENGTH_SHORT).show();
@@ -3989,6 +4623,7 @@ public class MainActivity extends Activity {
 
                     final String[] format = resolveAudioFormat(raw, musicUrl);
                     final long durationMs = readAudioDurationMs(raw);
+                    final long bitrate = readAudioBitrate(raw);
                     final Uri uri = insertAudioIntoLibrary(raw, musicTitle, format[0], format[1],
                             "正在写入音乐库");
                     markMediaSaved(mediaKey, uri);
@@ -4001,10 +4636,30 @@ public class MainActivity extends Activity {
                             isDownloading = false;
                             progressBar.setVisibility(View.GONE);
                             String duration = formatDuration(durationMs);
+
+                            StringBuilder quality = new StringBuilder();
+                            quality.append(format[0].toUpperCase(Locale.ROOT));
+                            if (bitrate > 0) {
+                                quality.append(" · ").append(bitrate / 1000L).append(" kbps");
+                            }
+                            quality.append(" · 原文件直存，未重编码");
+
+                            // 把「实际拿到的音质」明确讲出来：抖音音源本身没有无损，
+                            // 万一只下发到试听片段也要说清，否则用户会以为保存坏了。
+                            String note;
+                            if (isLosslessFormat(format[0])) {
+                                note = getString(R.string.music_lossless_ok);
+                            } else if (durationMs > 0L && durationMs <= 35000L) {
+                                note = getString(R.string.music_preview_warn_fmt,
+                                        duration.isEmpty() ? "很短" : duration);
+                            } else {
+                                note = getString(R.string.music_lossy_note);
+                            }
+
                             String message = "已保存《" + musicTitle + "》"
-                                    + (duration.isEmpty() ? "" : "（时长 " + duration + "）");
-                            setStatus(message + "  ·  " + format[0].toUpperCase(Locale.ROOT)
-                                    + " 原格式未重编码，已存入音乐库「" + ALBUM_DIR + "」",
+                                    + (duration.isEmpty() ? "" : "（" + duration + "）")
+                                    + "：" + quality + "；" + note;
+                            setStatus(message + "  ·  已存入音乐库「" + ALBUM_DIR + "」",
                                     R.color.color_success);
                             Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
                         }
@@ -4099,6 +4754,35 @@ public class MainActivity extends Activity {
         return new String[]{"mp3", "audio/mpeg"};
     }
 
+    /**
+     * 读音频的平均码率（bps）；读不到返回 0。
+     *
+     * <p>用于把「实际拿到的音质」直接报给用户 —— 抖音音源本身不提供无损
+     * （官方管线是 AAC-LC，高质量档位约 128 kbps 封顶），把码率说清楚，
+     * 用户才不会以为存下来的是无损。
+     */
+    private static long readAudioBitrate(File file) {
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(file.getAbsolutePath());
+            String value = retriever.extractMetadata(
+                    MediaMetadataRetriever.METADATA_KEY_BITRATE);
+            if (value == null || value.isEmpty()) return 0L;
+            return Long.parseLong(value);
+        } catch (Exception e) {
+            return 0L;
+        } finally {
+            try { retriever.release(); } catch (Exception ignored) { }
+        }
+    }
+
+    /** 这个格式是不是无损容器（用于给用户一个明确的「是无损」结论）。 */
+    private static boolean isLosslessFormat(String extension) {
+        if (extension == null) return false;
+        String e = extension.toLowerCase(Locale.ROOT);
+        return "flac".equals(e) || "wav".equals(e) || "ape".equals(e) || "alac".equals(e);
+    }
+
     /** 依据文件头字节识别音频容器/编码；识别不出返回 null。 */
     private static String[] detectAudioFormat(File file) {
         byte[] head = new byte[16];
@@ -4163,6 +4847,96 @@ public class MainActivity extends Activity {
         if (durationMs <= 0L) return "";
         long totalSeconds = (durationMs + 500L) / 1000L;
         return String.format(Locale.CHINA, "%d:%02d", totalSeconds / 60L, totalSeconds % 60L);
+    }
+
+    /**
+     * 把本地视频文件里的音轨**原样抽出来**，封装成独立音频文件（用于视频号这类
+     * 没有独立音乐资源的作品）。
+     *
+     * <p>关键设计：走 {@link MediaExtractor} + {@link MediaMuxer} 直接把压缩帧搬进新容器，
+     * **不解码、不重编码**。所以抽出来的音频和视频里那条音轨逐字节同级，不存在任何代际
+     * 损失——这已经是「从视频里拿音乐」能做到的最保真方式（再往上只有平台没提供的无损源）。
+     *
+     * @return 音频轨的时长（微秒）；没有音频轨时抛异常，由调用方提示用户。
+     */
+    private static long extractAudioTrack(File video, File output) throws Exception {
+        MediaExtractor extractor = new MediaExtractor();
+        MediaMuxer muxer = null;
+        try {
+            extractor.setDataSource(video.getAbsolutePath());
+            int audioTrack = -1;
+            MediaFormat audioFormat = null;
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat format = extractor.getTrackFormat(i);
+                String mime = format.getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("audio/")) {
+                    audioTrack = i;
+                    audioFormat = format;
+                    break;
+                }
+            }
+            if (audioTrack < 0) throw new Exception("这条作品没有音轨，无法提取音乐");
+            extractor.selectTrack(audioTrack);
+
+            muxer = new MediaMuxer(output.getAbsolutePath(),
+                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            int outTrack = muxer.addTrack(audioFormat);
+            muxer.start();
+
+            int maxInput = audioFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)
+                    ? Math.max(256 * 1024, audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    : 1024 * 1024;
+            ByteBuffer buffer = ByteBuffer.allocateDirect(maxInput);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            long lastTimeUs = 0L;
+            while (true) {
+                buffer.clear();
+                int size = extractor.readSampleData(buffer, 0);
+                if (size < 0) break;
+                long sampleTimeUs = extractor.getSampleTime();
+                if (sampleTimeUs < 0) break;
+                int sampleFlags = extractor.getSampleFlags();
+                info.offset = 0;
+                info.size = size;
+                info.presentationTimeUs = sampleTimeUs;
+                info.flags = (sampleFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                muxer.writeSampleData(outTrack, buffer, info);
+                lastTimeUs = sampleTimeUs;
+                extractor.advance();
+            }
+            if (lastTimeUs <= 0L) throw new Exception("音轨里没有可提取的音频数据");
+            return lastTimeUs;
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) { }
+            if (muxer != null) {
+                try { muxer.stop(); } catch (Exception ignored) { }
+                try { muxer.release(); } catch (Exception ignored) { }
+            }
+        }
+    }
+
+    /**
+     * 从已落盘的视频 Uri 里抽出音轨。视频先拷到缓存目录——MediaExtractor 只认文件路径，
+     * 而 MediaStore 给的是 content:// Uri。
+     */
+    private File extractAudioFromVideoUri(Uri videoUri, File workDir) throws Exception {
+        File local = new File(workDir, "source.mp4");
+        InputStream in = getContentResolver().openInputStream(videoUri);
+        if (in == null) throw new Exception("无法读取刚保存的视频");
+        try {
+            try (FileOutputStream out = new FileOutputStream(local)) {
+                byte[] buffer = new byte[128 * 1024];
+                int read;
+                while ((read = in.read(buffer)) > 0) out.write(buffer, 0, read);
+            }
+        } finally {
+            try { in.close(); } catch (Exception ignored) { }
+        }
+        if (local.length() == 0L) throw new Exception("刚保存的视频读取为空");
+        File audio = new File(workDir, "audio.m4a");
+        extractAudioTrack(local, audio);
+        return audio;
     }
 
     private void setStatus(String text, int colorRes) {

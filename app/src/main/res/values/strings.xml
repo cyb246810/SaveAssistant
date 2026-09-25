@@ -11,10 +11,20 @@
     <string name="btn_save_media">保存所选内容</string>
     <string name="btn_stitch_video">拼接视频</string>
     <string name="btn_save_as_video">保存为视频</string>
-    <string name="btn_save_music">保存完整音乐</string>
+    <string name="btn_save_music">仅保存音乐</string>
     <string name="music_unknown_title">抖音音乐</string>
     <string name="music_duplicate">这首音乐已经保存过了，已防止重复保存</string>
     <string name="music_none">当前作品没有识别到完整音乐</string>
+    <!-- 音质提示：抖音音源本身不提供无损，把实际拿到的编码/码率说清楚，别让人误以为是无损 -->
+    <string name="music_preview_warn_fmt">注意：只拿到试听片段（%1$s），平台没有下发完整曲目</string>
+    <string name="music_lossless_ok">这是无损音源（已原样保存，未重编码）</string>
+    <string name="music_lossy_note">抖音音源最高约 128 kbps AAC，无法提供无损</string>
+    <string name="music_extract_note">视频号没有独立音乐资源，已从原片音轨原样提取</string>
+    <string name="music_extract_done_title">音乐已保存</string>
+    <string name="music_extract_keep_msg">《%1$s》的音乐已存入音乐库。提取时会先落一份原片，现在还要保留这个视频吗？</string>
+    <string name="music_extract_keep">保留视频</string>
+    <string name="music_extract_delete">只留音乐</string>
+    <string name="music_extract_deleted">已删除原片，只保留音乐</string>
     <string name="btn_select_all">全选</string>
     <string name="btn_select_none">取消全选</string>
     <string name="photo_count_format">共解析到 %1$d 项内容，请选择要保存的项目</string>
@@ -35,18 +45,18 @@
     <string name="usage_title">使用说明</string>
     <string name="usage_expand">展开说明  ▼</string>
     <string name="usage_collapse">收起说明  ▲</string>
-    <string name="usage_body">1. 在抖音复制本人作品或已获授权内容的分享链接\n2. 回到本应用后会自动解析，也可点输入框右上角「粘贴」后手动解析\n3. 普通视频保存一个 MP4。解析后若该作品有封面，会出现「把封面做进视频」勾选框：勾上再保存，会把作者那张封面写进视频文件的元数据（不重新编码，跟存原片一样快）。相册或播放器若读取这条封面，缩略图就显示它；不读取也完全不影响视频本身。若同时勾了「把标题加进视频画面」，则整段重编码并把封面铺在开头，那样明显更慢；照片作品可逐项查看缩略图并勾选\n4. 实况作品也只保存一个动态 MP4，不再额外保存封面照片\n5. 单张照片识别到音乐时可「保存为视频」；多项图文/实况可「拼接视频」，照片时长支持快捷预设和自定义，并按需加入原作品音乐或视频原声\n6. 识别到作品音乐时会出现「保存完整音乐」：直接下载平台上的原始音乐文件存入音乐库「保存助手」，不重新编码，音质与原文件一致，文件名用原作品音乐名
+    <string name="usage_body">1. 在抖音复制本人作品或已获授权内容的分享链接\n2. 回到本应用后会自动解析，也可点输入框右上角「粘贴」后手动解析\n3. 普通视频保存一个 MP4。解析后若该作品有封面，会出现「把封面做进视频」勾选框：勾上再保存，会把作者那张封面写进视频文件的元数据（不重新编码，跟存原片一样快）。相册或播放器若读取这条封面，缩略图就显示它；不读取也完全不影响视频本身。若同时勾了「把标题加进视频画面」，则整段重编码并把封面铺在开头，那样明显更慢；照片作品可逐项查看缩略图并勾选\n4. 实况作品也只保存一个动态 MP4，不再额外保存封面照片\n5. 单张照片识别到音乐时可「保存为视频」；多项图文/实况可「拼接视频」，照片时长支持快捷预设和自定义，并按需加入原作品音乐或视频原声\n6. 识别到作品音乐时会出现「仅保存音乐」：只下载平台上的原始音乐文件存入音乐库「保存助手」，不重新编码，音质与原文件一致，文件名用原作品音乐名。保存成功后会报出实际编码、码率与时长——抖音音源本身不提供无损（官方音质约 128 kbps AAC 封顶），若平台只下发试听片段，提示里会直接写明「只拿到试听片段」，不会让人误以为是无损。微信视频号没有独立音乐资源，同一个按钮会自动改为「先存原片 → 把音轨原样抽出来」存成 .m4a，同样不重编码，音质与视频里那条音轨完全一致，提取完可自行决定原片留不留
 7. 微信视频号：直接粘贴 weixin.qq.com/sph 分享链接即可解析并保存原片（明文 MP4），无需任何设置——已内置登录态。若某天提示「登录态已失效」，再把浏览器里 yuanbao.tencent.com 任一 api 请求「复制为 cURL (bash)」粘进本输入框并点「解析作品」即可换新
-8. 视频号没有独立的音乐资源（音频就是视频本身的音轨），所以「保存完整音乐」只对抖音作品生效</string>
+8. 视频号没有独立的音乐资源（音频就是视频本身的音轨），所以「仅保存音乐」会自动改用提取音轨的方式：先存一份原片，再把音轨原样抽成 .m4a 音乐文件，抽完会问一句原片是否保留。整条链路都不重编码，因此不存在代际损失——这是「从视频里拿音乐」能做到的最保真方式；平台本身没有下发无损音源，任何号称「转换出无损」的做法都只是重新编码，只会更差</string>
     <string name="notice_body">请仅保存本人作品或已获得作者许可的内容，并遵守平台规则与著作权法律。平台页面结构更新后，解析功能可能暂时不可用。</string>
     <string name="mode_save">保存</string>
     <string name="mode_transfer">传输</string>
     <string name="transfer_pc_title">电脑连接</string>
-    <string name="transfer_pc_status_idle">未连接电脑</string>
+    <string name="transfer_pc_status_idle">进入本页会自动连接上次的电脑</string>
     <string name="transfer_addr_hint">电脑地址，例如 192.168.1.20:18765</string>
     <string name="transfer_find">查找电脑</string>
     <string name="transfer_connect_now">连接</string>
-    <string name="transfer_pc_hint">电脑端打开「保存助手 · 传输工作台」后，可用「查找电脑」自动发现；也可手动填入电脑上显示的局域网 IP。传输全程只在同一局域网内进行，不经过外网。</string>
+    <string name="transfer_pc_hint">进入本页会自动连接上次用过的电脑；连不上时才自动搜索一次，也可以点「查找电脑」或手动填入电脑上显示的局域网 IP。传输全程只在同一局域网内进行，不经过外网。</string>
     <string name="transfer_media_title">可传输内容</string>
     <string name="transfer_refresh">刷新</string>
     <string name="transfer_select_all">全选</string>
@@ -54,6 +64,8 @@
     <string name="transfer_list_empty">还没有可传输的内容，先去「保存」页保存作品</string>
     <string name="transfer_start">传输到电脑</string>
     <string name="transfer_connecting">正在查找 / 连接电脑…</string>
+    <string name="transfer_auto_connecting">正在自动连接上次的电脑…</string>
+    <string name="transfer_auto_idle">没连上电脑，可点「查找电脑」或手动填地址</string>
     <string name="transfer_not_found">没找到电脑。请确认手机与电脑在同一 Wi-Fi，或手动填写电脑上显示的地址。</string>
     <string name="transfer_found_fmt">已找到电脑：%1$s</string>
     <string name="transfer_connected_fmt">已连接：%1$s</string>
@@ -62,6 +74,9 @@
     <string name="transfer_selected_none">请先勾选要传输的内容</string>
     <string name="transfer_sending_fmt">正在传输 %1$s（第 %2$d / %3$d 个）</string>
     <string name="transfer_all_done_fmt">传输完成：成功 %1$d 个，失败 %2$d 个</string>
+    <string name="transfer_first_error_fmt">失败原因：%1$s</string>
+    <string name="transfer_retrying_fmt">%1$s 传输中断，正在重试…</string>
+    <string name="transfer_skipped_gone_fmt">已跳过 %1$d 个已被删除的文件（记录已同步移除）</string>
     <string name="transfer_expand_fmt">展开全部（共 %1$d 项）</string>
     <string name="transfer_collapse_fmt">收起（只显示最新 %1$d 项）</string>
     <string name="transfer_disconnected">连接已断开，请重新连接电脑</string>
