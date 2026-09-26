@@ -69,6 +69,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.content.DialogInterface;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 
 import java.io.File;
 import java.io.ByteArrayOutputStream;
@@ -2792,6 +2794,25 @@ public class MainActivity extends Activity {
         return new SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(new Date(savedAt));
     }
 
+    /** 包名里出现这些词就当成相册（小写比对）。
+     *  覆盖主流机型的相册包名：AOSP/小米 gallery、华为 photos、三星 gallery3d 等。
+     *  **刻意不含 "media"** —— 那个词太泛，容易命中一些媒体工具而不是相册。 */
+    private static final String[] GALLERY_PACKAGE_HINTS = {
+            "gallery", "photos", "album", "picture"
+    };
+
+    /**
+     * 打开一条已保存的媒体。
+     *
+     * <p>要的是「进系统相册」。但 {@code ACTION_VIEW} 只给一个通配类型
+     * （{@code video/*}）时，相册和文件管理器都匹配得上，系统会弹选择框；
+     * 用户一旦点了「文件管理」并勾上「始终」，以后就再也进不了相册 ——
+     * 「查看打开的总是文件里的那个播放器」就是这么来的。
+     *
+     * <p>所以这里**主动挑出相册**再 {@code setPackage} 定向打开。挑不出来、
+     * 或相册拒收这一条，就退回普通的 {@code ACTION_VIEW}。
+     * <b>最差也只是恢复到以前的行为</b>，不会因为识别不准反而打不开。
+     */
     private void openRecentMedia(RecentRecord record) {
         Uri uri = Uri.parse(record.uri);
         if (!mediaUriExists(uri)) {
@@ -2800,18 +2821,126 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "相册中已找不到这个文件，记录已移除", Toast.LENGTH_LONG).show();
             return;
         }
-        String mime = !TextUtils.isEmpty(record.mimeType)
-                ? record.mimeType
-                : (record.typeLabel.contains("照片") ? "image/*"
-                : (record.typeLabel.contains("音乐") ? "audio/*" : "video/*"));
+        String mime = resolveRecentMime(record);
+
         Intent intent = new Intent(Intent.ACTION_VIEW);
         intent.setDataAndType(uri, mime);
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+        // 音频没有「相册」可言，直接交给系统音乐/播放器
+        if (!mime.startsWith("audio/")) {
+            String gallery = findGalleryPackage();
+            if (gallery != null) {
+                Intent targeted = new Intent(intent);
+                targeted.setPackage(gallery);
+                try {
+                    startActivity(targeted);
+                    return;
+                } catch (Exception ignored) {
+                    // 个别机型的相册不认从别的应用来的条目，退回通用方式就好
+                }
+            }
+        }
+
         try {
             startActivity(intent);
         } catch (Exception e) {
             Toast.makeText(this, "手机上没有可查看此文件的应用", Toast.LENGTH_LONG).show();
         }
+    }
+
+    /** 记录里的 MIME。历史记录可能是旧版本写的、没有这个字段，按类型标签兜底。 */
+    private String resolveRecentMime(RecentRecord record) {
+        if (record == null) return "video/*";
+        if (!TextUtils.isEmpty(record.mimeType)) return record.mimeType;
+        if (record.typeLabel != null && record.typeLabel.contains("照片")) return "image/*";
+        if (record.typeLabel != null && record.typeLabel.contains("音乐")) return "audio/*";
+        return "video/*";
+    }
+
+    /**
+     * 找系统相册的包名；找不到返回 null（调用方会退回通用 ACTION_VIEW）。
+     *
+     * <p>判据是「**同时**能处理 {@code image/*} 和 {@code video/*} 的应用」：
+     * 相册是唯一同时认这两类的；单纯视频播放器只认 video，文件管理器一般
+     * 不会为图片注册 ACTION_VIEW。取交集能一次性把两者都排除掉。
+     *
+     * <p>候选多于一个时：先看哪个是「图片的默认打开方式」（多数机型上就是相册），
+     * 再看包名里像不像相册，都不像就按包名排序取第一个 ——
+     * **这里刻意不弹选择框**，弹了就等于没解决问题。
+     */
+    private String findGalleryPackage() {
+        PackageManager pm = getPackageManager();
+        Set<String> candidates = new HashSet<>(viewerPackages(pm, "image/*"));
+        candidates.retainAll(viewerPackages(pm, "video/*"));
+        if (candidates.isEmpty()) return null;
+
+        String preferred = null;
+        try {
+            Intent probe = new Intent(Intent.ACTION_VIEW);
+            probe.setType("image/*");
+            probe.addCategory(Intent.CATEGORY_DEFAULT);
+            ResolveInfo resolved = pm.resolveActivity(probe, PackageManager.MATCH_DEFAULT_ONLY);
+            if (resolved != null && resolved.activityInfo != null) {
+                preferred = resolved.activityInfo.packageName;
+            }
+        } catch (Exception ignored) {
+            // 查询失败不致命，"默认应用"这一档跳过即可
+        }
+        return pickGalleryPackage(candidates, preferred);
+    }
+
+    /**
+     * 从候选里挑一个相册包名；挑不出来返回 null。
+     *
+     * <p><b>纯函数</b>，不碰 PackageManager —— 「挑谁」这套优先级是最容易改坏、
+     * 又最难在真机上发现的部分（挑错了只是打开别的应用，不会报错），
+     * 所以单拎出来让 JVM 单测能锁住。
+     *
+     * <p>优先级：① 包名里带 gallery/photos/album… 的 —— 这是「系统相册」最直接的
+     * 信号；② 候选里那位「图片的默认打开方式」；③ 按包名排序取第一个。
+     *
+     * <p>**为什么包名特征排在「默认应用」前面**：默认应用只是间接线索。
+     * 用户完全可能把某个文件管理器设成图片默认，照它走就等于没修这个问题；
+     * 而包名里带 gallery/photos 的，基本就是系统相册本身。
+     *
+     * <p>**刻意不弹选择框** —— 弹了就等于没解决问题。
+     */
+    static String pickGalleryPackage(Set<String> candidates, String preferredPackage) {
+        if (candidates == null || candidates.isEmpty()) return null;
+        List<String> sorted = new ArrayList<>(candidates);
+        Collections.sort(sorted);
+        for (String hint : GALLERY_PACKAGE_HINTS) {
+            for (String pkg : sorted) {
+                if (pkg.toLowerCase(Locale.ROOT).contains(hint)) return pkg;
+            }
+        }
+        if (preferredPackage != null && candidates.contains(preferredPackage)) {
+            return preferredPackage;
+        }
+        return sorted.get(0);
+    }
+
+    /** 能处理某个 MIME 的 ACTION_VIEW 的包名集合。 */
+    private static Set<String> viewerPackages(PackageManager pm, String mime) {
+        Set<String> out = new HashSet<>();
+        try {
+            Intent probe = new Intent(Intent.ACTION_VIEW);
+            probe.setType(mime);
+            probe.addCategory(Intent.CATEGORY_DEFAULT);
+            List<ResolveInfo> resolved = pm.queryIntentActivities(probe, 0);
+            if (resolved != null) {
+                for (ResolveInfo info : resolved) {
+                    if (info != null && info.activityInfo != null
+                            && !TextUtils.isEmpty(info.activityInfo.packageName)) {
+                        out.add(info.activityInfo.packageName);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // 拿不到就当没有候选，调用方会退回通用方式
+        }
+        return out;
     }
 
     private void showRecentRecordManagement(final RecentRecord record) {
