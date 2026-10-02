@@ -19,7 +19,7 @@
     <string name="music_preview_warn_fmt">注意：只拿到试听片段（%1$s），平台没有下发完整曲目</string>
     <string name="music_lossless_ok">这是无损音源（已原样保存，未重编码）</string>
     <string name="music_lossy_note">抖音音源最高约 128 kbps AAC，无法提供无损</string>
-    <string name="music_extract_note">视频号没有独立音乐资源，已从原片音轨原样提取</string>
+    <string name="music_extract_note">视频号没有独立音乐资源，已从原片音轨提取（方式见上）</string>
     <string name="music_extract_done_title">音乐已保存</string>
     <string name="music_extract_keep_msg">《%1$s》的音乐已存入音乐库。提取时会先落一份原片，现在还要保留这个视频吗？</string>
     <string name="music_extract_keep">保留视频</string>

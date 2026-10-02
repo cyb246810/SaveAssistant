@@ -529,7 +529,13 @@ public final class MediaStitcher {
         }
     }
 
-    private static final class PcmData {
+    /**
+     * 解码出的 PCM 音频。
+     *
+     * <p>提为包级可见是为了让 {@link MainActivity} 的「抽音轨兜底路径」直接复用
+     * {@link #decodeAudioToPcm(File)}——解码器只有一份实现，不复制第二套。
+     */
+    static final class PcmData {
         final short[] samples;
         final int sampleRate;
         final int channels;
@@ -600,103 +606,21 @@ public final class MediaStitcher {
             return new AudioComposeResult(true, musicUsed, originalUsed, warning.length() == 0 ? null : warning.toString());
         }
 
-        private void encodeAac(File originalPcm, short[] musicStereo, long totalFrames, File output) throws Exception {
-            MediaFormat format = MediaFormat.createAudioFormat(AUDIO_MIME, AUDIO_RATE, AUDIO_CHANNELS);
-            format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
-            format.setInteger(MediaFormat.KEY_BIT_RATE, 192000);
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 32 * 1024);
-            MediaCodec encoder = MediaCodec.createEncoderByType(AUDIO_MIME);
-            MediaMuxer muxer = null;
-            FileInputStream originalIn = null;
-            boolean muxerStarted = false;
-            int track = -1;
-            try {
-                encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                encoder.start();
-                muxer = new MediaMuxer(output.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-                if (originalPcm != null) originalIn = new FileInputStream(originalPcm);
-                long submittedFrames = 0;
-                int musicFrame = 0;
-                boolean inputDone = false;
-                boolean outputDone = false;
-                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-                byte[] originalBytes = new byte[32768];
-
-                while (!outputDone) {
-                    if (!inputDone) {
-                        int inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US);
-                        if (inputIndex >= 0) {
-                            ByteBuffer in = encoder.getInputBuffer(inputIndex);
-                            if (in == null) throw new Exception("AAC 输入缓冲区为空");
-                            in.clear(); in.order(ByteOrder.LITTLE_ENDIAN);
-                            if (submittedFrames >= totalFrames) {
-                                encoder.queueInputBuffer(inputIndex, 0, 0, submittedFrames * 1_000_000L / AUDIO_RATE, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-                                inputDone = true;
-                            } else {
-                                int maxFrames = Math.max(1, in.remaining() / 4);
-                                int frames = (int) Math.min(maxFrames, totalFrames - submittedFrames);
-                                int neededBytes = frames * 4;
-                                int got = 0;
-                                if (originalIn != null) {
-                                    while (got < neededBytes) {
-                                        int n = originalIn.read(originalBytes, got, neededBytes - got);
-                                        if (n < 0) break;
-                                        got += n;
-                                    }
-                                }
-                                for (int f = 0; f < frames; f++) {
-                                    int off = f * 4;
-                                    short ol = got >= off + 4 ? littleShort(originalBytes, off) : 0;
-                                    short or = got >= off + 4 ? littleShort(originalBytes, off + 2) : 0;
-                                    short ml = 0, mr = 0;
-                                    if (musicStereo != null && musicStereo.length >= 2) {
-                                        int mf = (musicFrame % (musicStereo.length / 2)) * 2;
-                                        ml = musicStereo[mf]; mr = musicStereo[mf + 1]; musicFrame++;
-                                    }
-                                    boolean hasOriginal = originalIn != null;
-                                    boolean hasMusic = musicStereo != null && musicStereo.length >= 2;
-                                    int left, right;
-                                    if (hasOriginal && hasMusic) {
-                                        left = (int) (ol * 0.72f + ml * 0.72f);
-                                        right = (int) (or * 0.72f + mr * 0.72f);
-                                    } else if (hasMusic) { left = ml; right = mr; }
-                                    else { left = ol; right = or; }
-                                    in.putShort(clampShort(left)); in.putShort(clampShort(right));
-                                }
-                                long pts = submittedFrames * 1_000_000L / AUDIO_RATE;
-                                encoder.queueInputBuffer(inputIndex, 0, frames * 4, pts, 0);
-                                submittedFrames += frames;
-                            }
-                        }
-                    }
-                    int outIndex = encoder.dequeueOutputBuffer(info, CODEC_TIMEOUT_US);
-                    if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                        if (muxerStarted) throw new Exception("AAC 输出格式重复变化");
-                        track = muxer.addTrack(encoder.getOutputFormat()); muxer.start(); muxerStarted = true;
-                    } else if (outIndex >= 0) {
-                        ByteBuffer data = encoder.getOutputBuffer(outIndex);
-                        if (data == null) throw new Exception("AAC 输出缓冲区为空");
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0;
-                        if (info.size > 0 && muxerStarted) {
-                            data.position(info.offset); data.limit(info.offset + info.size); muxer.writeSampleData(track, data, info);
-                        }
-                        encoder.releaseOutputBuffer(outIndex, false);
-                        if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true;
-                    }
-                }
-            } finally {
-                if (originalIn != null) try { originalIn.close(); } catch (Exception ignored) {}
-                try { encoder.stop(); } catch (Exception ignored) {}
-                encoder.release();
-                if (muxer != null) {
-                    if (muxerStarted) try { muxer.stop(); } catch (Exception ignored) {}
-                    muxer.release();
-                }
-            }
-        }
     }
 
     private static PcmData decodeAudio(File source) throws Exception {
+        return decodeAudioToPcm(source);
+    }
+
+    /**
+     * 把视频/音频文件里的音轨解码成 PCM。抽音轨的兜底路径也用这个。
+     *
+     * <p>走 {@link MediaCodec} 解码器（而不是 {@link MediaExtractor} 直接搬压缩帧）
+     * 是刻意的：视频号有部分作品做了特殊封装，Extractor 能读到 moov 里的音轨元数据
+     * 却读不出采样数据，而解码器走的是另一套解析路径，能把它救回来。
+     * 代价是这条路径会重编码（有代际损失），所以只当兜底，不作首选。
+     */
+    static PcmData decodeAudioToPcm(File source) throws Exception {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec decoder = null;
         try {
@@ -791,6 +715,137 @@ public final class MediaStitcher {
             }
         }
         return out;
+    }
+
+    /**
+     * 把 PCM 重编码成 AAC 并封装成 M4A 文件。抽音轨的兜底路径用它落盘。
+     *
+     * <p>PCM 一律转成立体声 44.1kHz（{@link #AUDIO_RATE}）—— 手机上 AAC 编码器
+     * 对立体声 44.1kHz 的支持最稳，单声道或非标采样率部分机型会直接 `configure` 失败。
+     */
+    static void encodePcmToM4a(PcmData pcm, File output) throws Exception {
+        if (pcm == null || pcm.samples == null || pcm.samples.length < 2) {
+            throw new Exception("解码出的音频是空的，无法重编码");
+        }
+        // 统一成编码器最稳的规格：立体声 44.1kHz
+        final int frames = pcm.samples.length / Math.max(1, pcm.channels);
+        final long totalFrames = pcm.sampleRate == AUDIO_RATE
+                ? frames : Math.max(1, Math.round(frames * (double) AUDIO_RATE / pcm.sampleRate));
+        final File pcmFeed = File.createTempFile("pcmfeed", ".raw");
+        try {
+            try (FileOutputStream out = new FileOutputStream(pcmFeed)) {
+                if (pcm.sampleRate == AUDIO_RATE && pcm.channels == 2) {
+                    writeShorts(out, pcm.samples, pcm.samples.length);
+                } else {
+                    short[] stereo = resampleToStereo(pcm, AUDIO_RATE);
+                    writeShorts(out, stereo, stereo.length);
+                }
+            }
+            encodeAac(pcmFeed, null, totalFrames, output);
+        } finally {
+            // 临时 PCM 不留，避免把整段音频的裸数据堆在磁盘上
+            if (pcmFeed.exists()) pcmFeed.delete();
+        }
+    }
+
+    /** 把 PCM 裸数据（双声道 44.1kHz 小端）编码成 AAC 封进 M4A。供上面与混音路径共用。 */
+    private static void encodeAac(File pcmSource, short[] musicStereo, long totalFrames,
+                                  File output) throws Exception {
+        MediaFormat format = MediaFormat.createAudioFormat(AUDIO_MIME, AUDIO_RATE, AUDIO_CHANNELS);
+        format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 192000);
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 32 * 1024);
+        MediaCodec encoder = MediaCodec.createEncoderByType(AUDIO_MIME);
+        MediaMuxer muxer = null;
+        FileInputStream originalIn = null;
+        boolean muxerStarted = false;
+        int track = -1;
+        try {
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            encoder.start();
+            muxer = new MediaMuxer(output.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            if (pcmSource != null) originalIn = new FileInputStream(pcmSource);
+            long submittedFrames = 0;
+            int musicFrame = 0;
+            boolean inputDone = false;
+            boolean outputDone = false;
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            byte[] originalBytes = new byte[32768];
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    int inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US);
+                    if (inputIndex >= 0) {
+                        ByteBuffer in = encoder.getInputBuffer(inputIndex);
+                        if (in == null) throw new Exception("AAC 输入缓冲区为空");
+                        in.clear(); in.order(ByteOrder.LITTLE_ENDIAN);
+                        if (submittedFrames >= totalFrames) {
+                            encoder.queueInputBuffer(inputIndex, 0, 0,
+                                    submittedFrames * 1_000_000L / AUDIO_RATE,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            inputDone = true;
+                        } else {
+                            int maxFrames = Math.max(1, in.remaining() / 4);
+                            int frames = (int) Math.min(maxFrames, totalFrames - submittedFrames);
+                            int neededBytes = frames * 4;
+                            int got = 0;
+                            if (originalIn != null) {
+                                while (got < neededBytes) {
+                                    int n = originalIn.read(originalBytes, got, neededBytes - got);
+                                    if (n < 0) break;
+                                    got += n;
+                                }
+                            }
+                            for (int f = 0; f < frames; f++) {
+                                int off = f * 4;
+                                short ol = got >= off + 4 ? littleShort(originalBytes, off) : 0;
+                                short or = got >= off + 4 ? littleShort(originalBytes, off + 2) : 0;
+                                short ml = 0, mr = 0;
+                                if (musicStereo != null && musicStereo.length >= 2) {
+                                    int mf = (musicFrame % (musicStereo.length / 2)) * 2;
+                                    ml = musicStereo[mf]; mr = musicStereo[mf + 1]; musicFrame++;
+                                }
+                                boolean hasOriginal = originalIn != null;
+                                boolean hasMusic = musicStereo != null && musicStereo.length >= 2;
+                                int left, right;
+                                if (hasOriginal && hasMusic) {
+                                    left = (int) (ol * 0.72f + ml * 0.72f);
+                                    right = (int) (or * 0.72f + mr * 0.72f);
+                                } else if (hasMusic) { left = ml; right = mr; }
+                                else { left = ol; right = or; }
+                                in.putShort(clampShort(left)); in.putShort(clampShort(right));
+                            }
+                            long pts = submittedFrames * 1_000_000L / AUDIO_RATE;
+                            encoder.queueInputBuffer(inputIndex, 0, frames * 4, pts, 0);
+                            submittedFrames += frames;
+                        }
+                    }
+                }
+                int outIndex = encoder.dequeueOutputBuffer(info, CODEC_TIMEOUT_US);
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (muxerStarted) throw new Exception("AAC 输出格式重复变化");
+                    track = muxer.addTrack(encoder.getOutputFormat()); muxer.start(); muxerStarted = true;
+                } else if (outIndex >= 0) {
+                    ByteBuffer data = encoder.getOutputBuffer(outIndex);
+                    if (data == null) throw new Exception("AAC 输出缓冲区为空");
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) info.size = 0;
+                    if (info.size > 0 && muxerStarted) {
+                        data.position(info.offset); data.limit(info.offset + info.size);
+                        muxer.writeSampleData(track, data, info);
+                    }
+                    encoder.releaseOutputBuffer(outIndex, false);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true;
+                }
+            }
+        } finally {
+            if (originalIn != null) try { originalIn.close(); } catch (Exception ignored) {}
+            try { encoder.stop(); } catch (Exception ignored) {}
+            encoder.release();
+            if (muxer != null) {
+                if (muxerStarted) try { muxer.stop(); } catch (Exception ignored) {}
+                muxer.release();
+            }
+        }
     }
 
     private static void writeShorts(OutputStream out, short[] samples, int sampleCount) throws Exception {
