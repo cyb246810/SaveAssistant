@@ -4271,7 +4271,6 @@ public class MainActivity extends Activity {
                                     : (result.titleBurned ? "视频·带标题" : "视频"),
                             "video/mp4");
 
-
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
@@ -4666,9 +4665,14 @@ public class MainActivity extends Activity {
                             setStatus("正在提取音轨（不重编码）…", R.color.text_secondary);
                         }
                     });
-                    audio = extractAudioFromVideoUri(videoUri, workDir);
+                    AudioExtractResult extracted = extractAudioFromVideoUri(videoUri, workDir);
+                    audio = extracted.file;
+                    // 时长以容器里读到的为准（比「最后一帧时间戳」准），
+                    // 抽轨自己报的那个只作兜底
                     durationUs = readAudioDurationUs(audio);
-                    final String[] format = resolveAudioFormat(audio, null);
+                    if (durationUs <= 0L) durationUs = extracted.durationUs;
+                    // 扩展名与 MIME 用抽轨时就知道的真值，不再靠文件头猜
+                    final String[] format = new String[]{extracted.extension, extracted.mime};
                     final long bitrate = readAudioBitrate(audio);
                     final long durationMs = durationUs > 0L ? durationUs / 1000L
                             : readAudioDurationMs(audio);
@@ -5067,6 +5071,27 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * 抽音轨的结果：文件本身，以及**它真正的**扩展名与 MIME。
+     *
+     * <p>为什么必须带回 MIME：原先扩展名/MIME 靠文件头猜，而 MediaMuxer 有多种容器
+     * 输出（M4A / 3GP 都以 {@code ftyp} 开头，光看文件头分不出来）。
+     * 猜错的话 Music App 会因为 MIME 不对而不收录，用户看到的就是「存了但音乐里没有」。
+     */
+    private static final class AudioExtractResult {
+        final File file;
+        final String extension;
+        final String mime;
+        final long durationUs;
+
+        AudioExtractResult(File file, String extension, String mime, long durationUs) {
+            this.file = file;
+            this.extension = extension;
+            this.mime = mime;
+            this.durationUs = durationUs;
+        }
+    }
+
+    /**
      * 把本地视频文件里的音轨**原样抽出来**，封装成独立音频文件（用于视频号这类
      * 没有独立音乐资源的作品）。
      *
@@ -5074,38 +5099,89 @@ public class MainActivity extends Activity {
      * **不解码、不重编码**。所以抽出来的音频和视频里那条音轨逐字节同级，不存在任何代际
      * 损失——这已经是「从视频里拿音乐」能做到的最保真方式（再往上只有平台没提供的无损源）。
      *
-     * @return 音频轨的时长（微秒）；没有音频轨时抛异常，由调用方提示用户。
+     * <p><b>容器会降级</b>：MP4 容器只认 AAC（{@code audio/mp4a-latm}），
+     * 碰上 AMR-NB/WB 这类音轨 {@link MediaMuxer#addTrack} 会直接抛异常——
+     * 而视频号的作品并不保证音轨是 AAC。失败时自动改用 3GP 容器（支持 AMR）再试一次。
+     *
+     * @return 抽出的音轨结果（文件 + 真实扩展名/MIME）；彻底失败时抛异常，由调用方提示用户。
      */
-    private static long extractAudioTrack(File video, File output) throws Exception {
+    private static AudioExtractResult extractAudioTrack(File video, File workDir) throws Exception {
         MediaExtractor extractor = new MediaExtractor();
-        MediaMuxer muxer = null;
         try {
             extractor.setDataSource(video.getAbsolutePath());
+
             int audioTrack = -1;
             MediaFormat audioFormat = null;
+            StringBuilder allTracks = new StringBuilder();
             for (int i = 0; i < extractor.getTrackCount(); i++) {
                 MediaFormat format = extractor.getTrackFormat(i);
                 String mime = format.getString(MediaFormat.KEY_MIME);
-                if (mime != null && mime.startsWith("audio/")) {
+                allTracks.append(mime == null ? "?" : mime).append(' ');
+                if (audioTrack < 0 && mime != null && mime.startsWith("audio/")) {
                     audioTrack = i;
                     audioFormat = format;
-                    break;
                 }
             }
-            if (audioTrack < 0) throw new Exception("这条作品没有音轨，无法提取音乐");
+            if (audioTrack < 0) {
+                // 视频号大量作品本身就是静音的，把真实轨道列出来，用户才知道不是软件坏了
+                throw new Exception("这条作品没有音轨（视频里只有：" + allTracks.toString().trim()
+                        + "），无法提取音乐");
+            }
+            final String audioMime = audioFormat.getString(MediaFormat.KEY_MIME);
             extractor.selectTrack(audioTrack);
 
-            muxer = new MediaMuxer(output.getAbsolutePath(),
-                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            // 先试 MP4；它装不下这条音轨时（如 AMR）再退到 3GP。
+            Exception mp4Error = null;
+            try {
+                return muxAudioTrack(extractor, audioFormat, new File(workDir, "audio.m4a"),
+                        MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4, "m4a", "audio/mp4");
+            } catch (IllegalArgumentException | UnsupportedOperationException e) {
+                // addTrack 拒绝该编码 —— 换容器还有救，别直接把这轮判死刑
+                mp4Error = e;
+            }
+            try {
+                return muxAudioTrack(extractor, audioFormat, new File(workDir, "audio.3gp"),
+                        MediaMuxer.OutputFormat.MUXER_OUTPUT_3GPP, "3gp", "audio/3gpp");
+            } catch (Exception e3gp) {
+                throw new Exception("音轨是 " + audioMime + "，既装不进 MP4 也装不进 3GP 容器"
+                        + "（MP4 报错：" + shortMessage(mp4Error) + "；3GP 报错："
+                        + shortMessage(e3gp) + "）");
+            }
+        } finally {
+            try { extractor.release(); } catch (Exception ignored) { }
+        }
+    }
+
+    /** 抽异常里的可读消息，避免把整串堆栈甩给用户。 */
+    private static String shortMessage(Throwable t) {
+        if (t == null) return "无";
+        String m = t.getMessage();
+        if (m == null || m.trim().isEmpty()) return t.getClass().getSimpleName();
+        return m.length() > 80 ? m.substring(0, 80) + "…" : m;
+    }
+
+    /**
+     * 把 extractor 当前选中的音轨搬进指定容器。**不重编码**，只复制压缩帧。
+     */
+    private static AudioExtractResult muxAudioTrack(MediaExtractor extractor,
+                                                     MediaFormat audioFormat, File output,
+                                                     int outputFormat, String extension,
+                                                     String mime) throws Exception {
+        MediaMuxer muxer = null;
+        boolean started = false;
+        try {
+            muxer = new MediaMuxer(output.getAbsolutePath(), outputFormat);
             int outTrack = muxer.addTrack(audioFormat);
             muxer.start();
+            started = true;
 
             int maxInput = audioFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)
-                    ? Math.max(256 * 1024, audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
+                    ? (int) Math.max(256 * 1024L, audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE))
                     : 1024 * 1024;
             ByteBuffer buffer = ByteBuffer.allocateDirect(maxInput);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             long lastTimeUs = 0L;
+            long samples = 0L;
             while (true) {
                 buffer.clear();
                 int size = extractor.readSampleData(buffer, 0);
@@ -5119,16 +5195,24 @@ public class MainActivity extends Activity {
                 info.flags = (sampleFlags & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
                         ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
                 muxer.writeSampleData(outTrack, buffer, info);
-                lastTimeUs = sampleTimeUs;
+                lastTimeUs = Math.max(lastTimeUs, sampleTimeUs);
+                samples++;
                 extractor.advance();
             }
-            if (lastTimeUs <= 0L) throw new Exception("音轨里没有可提取的音频数据");
-            return lastTimeUs;
+            // 用**采样点个数**判空，而不是时间戳：音轨第一帧的时间戳正常就是 0，
+            // 拿它判空会把「只有开头几帧」误判成「一条数据都没有」。
+            if (samples <= 0L) throw new Exception("音轨里没有可提取的音频数据");
+            return new AudioExtractResult(output, extension, mime, lastTimeUs);
         } finally {
-            try { extractor.release(); } catch (Exception ignored) { }
             if (muxer != null) {
-                try { muxer.stop(); } catch (Exception ignored) { }
+                // 没 start() 就 stop() 会抛 IllegalStateException；此时文件是废的，直接删
+                if (started) {
+                    try { muxer.stop(); } catch (Exception ignored) { }
+                }
                 try { muxer.release(); } catch (Exception ignored) { }
+                if (!started) {
+                    try { output.delete(); } catch (Exception ignored) { }
+                }
             }
         }
     }
@@ -5137,7 +5221,7 @@ public class MainActivity extends Activity {
      * 从已落盘的视频 Uri 里抽出音轨。视频先拷到缓存目录——MediaExtractor 只认文件路径，
      * 而 MediaStore 给的是 content:// Uri。
      */
-    private File extractAudioFromVideoUri(Uri videoUri, File workDir) throws Exception {
+    private AudioExtractResult extractAudioFromVideoUri(Uri videoUri, File workDir) throws Exception {
         File local = new File(workDir, "source.mp4");
         InputStream in = getContentResolver().openInputStream(videoUri);
         if (in == null) throw new Exception("无法读取刚保存的视频");
@@ -5151,9 +5235,12 @@ public class MainActivity extends Activity {
             try { in.close(); } catch (Exception ignored) { }
         }
         if (local.length() == 0L) throw new Exception("刚保存的视频读取为空");
-        File audio = new File(workDir, "audio.m4a");
-        extractAudioTrack(local, audio);
-        return audio;
+        AudioExtractResult result = extractAudioTrack(local, workDir);
+        // 抽出来的是个 0 字节文件时，写进音乐库只是个打不开的条目——早失败早说清
+        if (!result.file.isFile() || result.file.length() == 0L) {
+            throw new Exception("抽出的音频文件为空，未写入音乐库");
+        }
+        return result;
     }
 
     private void setStatus(String text, int colorRes) {
