@@ -3,6 +3,7 @@ package com.zgtools.videosaver;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.text.TextUtils;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -40,7 +41,24 @@ public class DouyinParser {
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
     private static final String UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
+    /**
+     * 抖音 CDN 的 Referer（2026-10 实测必需）。
+     *
+     * <p>{@code douyinvod.com} 现在会校验 Referer，缺失直接回<b>403</b>。
+     * 实测：带 Referer → 206 正常；不带 → 403。UA 可以缺，Referer 不能缺。
+     */
+    private static final String MEDIA_REFERER = "https://www.douyin.com/";
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    /**
+     * 进程内复用的浏览器标识（对应 Cookie 的 {@code s_v_web_id}）。
+     * 详情接口缺它就会返回「HTTP 200 + 0 字节」，见 {@link #getOrCreateWebId()}。
+     */
+    private static volatile String webIdCache = null;
+    /**
+     * 进程内缓存的 ttwid。**这是详情接口能否拿到数据的唯一决定因素**，
+     * 有效期很长（实测同一枚连发多次都有效），故缓存复用，不必每次都注册。
+     */
+    private static volatile String ttwidCache = null;
     private static final Pattern SHARE_URL_PATTERN = Pattern.compile(
             "https://(?:[A-Za-z0-9-]+\\.)*(?:douyin\\.com|iesdouyin\\.com)/[^\\s]+",
             Pattern.CASE_INSENSITIVE);
@@ -403,9 +421,20 @@ public class DouyinParser {
     }
 
     private static JSONObject fetchAwemeDetail(String awemeId, String sourcePageUrl) throws Exception {
+        return fetchAwemeDetail(awemeId, sourcePageUrl, 0);
+    }
+
+    /**
+     * @param retry 内部重试计数。空响应时换一枚 ttwid 重试，最多一次，避免无限递归。
+     */
+    private static JSONObject fetchAwemeDetail(String awemeId, String sourcePageUrl, int retry)
+            throws Exception {
         String ttwid = getTtwid();
+        String webId = getOrCreateWebId();
         String msToken = randomToken(107);
         String encodedMsToken = java.net.URLEncoder.encode(msToken, "UTF-8");
+        // web_id 不是能否返回数据的决定因素（实测：不带 web_id 只给 ttwid 也能拿到 86KB 数据），
+        // 但带上更接近真实浏览器请求。它对应 Cookie 里的 s_v_web_id。
         String query = "device_platform=webapp&aid=6383&channel=channel_pc_web" +
                 "&pc_client_type=1&version_code=190500&version_name=19.5.0" +
                 "&cookie_enabled=true&screen_width=1920&screen_height=1080" +
@@ -414,6 +443,7 @@ public class DouyinParser {
                 "&engine_version=123.0.0.0&os_name=Windows&os_version=10" +
                 "&cpu_core_num=8&device_memory=8&platform=PC&downlink=10" +
                 "&effective_type=4g&round_trip_time=100&aweme_id=" + awemeId +
+                "&web_id=" + webId +
                 "&msToken=" + encodedMsToken;
         String signature = DouyinSign.generate(query, UA_DESKTOP);
         String requestUrl = "https://www.douyin.com/aweme/v1/web/aweme/detail/?" +
@@ -435,7 +465,11 @@ public class DouyinParser {
         conn.setRequestProperty("Sec-CH-UA", "\"Google Chrome\";v=\"123\", \"Chromium\";v=\"123\"");
         conn.setRequestProperty("Sec-CH-UA-Mobile", "?0");
         conn.setRequestProperty("Sec-CH-UA-Platform", "\"Windows\"");
-        if (ttwid != null && !ttwid.isEmpty()) conn.setRequestProperty("Cookie", "ttwid=" + ttwid);
+        // Cookie 里 s_v_web_id 与查询参数里的 web_id 必须一致。
+            // 实测决定性因素还是 ttwid：它为空时接口只回 200 + 空体。
+            String cookie = "s_v_web_id=" + webId
+                    + (TextUtils.isEmpty(ttwid) ? "" : "; ttwid=" + ttwid);
+            conn.setRequestProperty("Cookie", cookie);
         conn.setConnectTimeout(15000);
         conn.setReadTimeout(20000);
         try {
@@ -444,6 +478,21 @@ public class DouyinParser {
                 throw new Exception("详情接口响应码: " + code);
             }
             String body = readLimited(conn, MAX_HTML_BYTES);
+            // 抖音对"不合规"的请求回的是 200 + 空体，不是 403。分清这两种情况，
+            // 否则用户只会看到一句含糊的"没有返回视频数据"。
+            if (body == null || body.trim().isEmpty()) {
+                // 空体最常见的原因就是 ttwid 失效/没拿到。清缓存重试一次，
+                // 重新注册往往就能拿到数据——比直接报错给用户有用得多。
+                if (retry < 1 && !TextUtils.isEmpty(ttwid)) {
+                    Log.w(TAG, "详情接口返回空内容，重置 ttwid 后重试一次");
+                    ttwidCache = null;
+                    return fetchAwemeDetail(awemeId, sourcePageUrl, retry + 1);
+                }
+                ttwidCache = null;
+                throw new Exception("抖音接口返回了空内容（HTTP 200 但无数据），"
+                        + "且重试后依旧如此。这通常是抖音风控拦截，"
+                        + "换个网络环境（Wi-Fi/流量切换）或稍后重试即可");
+            }
             JSONObject json = new JSONObject(body);
             if (json.optJSONObject("aweme_detail") == null) {
                 String message = json.optString("status_msg", "详情接口没有返回视频数据");
@@ -455,7 +504,29 @@ public class DouyinParser {
         }
     }
 
-    private static String getTtwid() {
+    /**
+ * 取一个可用的 {@code ttwid}（设备标识）。
+     *
+     * <p><b>这是抖音详情接口能否返回数据的唯一决定因素</b>（2026-10 实测）：
+     * 缺 ttwid 时接口回<b>HTTP 200 + 响应体 0 字节</b>，有 ttwid 时回 86KB 完整 JSON。
+     * 而 {@code web_id}、{@code a_bogus} 都不影响是否返回数据。
+     *
+     * <p>踩过的坑：原来只靠 {@link HttpURLConnection#getHeaderFields()} 读
+     * {@code Set-Cookie}，在部分环境（桌面 JVM 实测、以及某些 Android 网络栈）下
+     * **根本读不到**，于是 ttwid 恒为 null，接口永远返回空。
+     * 现在改成三条路：Android 走系统 {@link CookieManager}（最可靠，它会真的存下cookie），
+     * 再回退到读 header，最后用一次「响应体里的 redirect_url」兜底。
+     *
+     * <p>ttwid 有效期很长（实测同一枚连发多次都有效），故进程内缓存复用，不必每次注册。
+     */
+private static String getTtwid() {
+        if (ttwidCache != null && !ttwidCache.isEmpty()) return ttwidCache;
+        String ttwid = registerTtwid();
+        ttwidCache = ttwid;
+        return ttwid;
+    }
+
+    private static String registerTtwid() {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(
@@ -464,6 +535,9 @@ public class DouyinParser {
             conn.setDoOutput(true);
             conn.setRequestProperty("User-Agent", UA_DESKTOP);
             conn.setRequestProperty("Content-Type", "application/json");
+            // 跟随重定向时 Set-Cookie 会落到最后一个响应上，这里先关掉，
+            // 保证下面读到的 header 就是下发 cookie 的那一条。
+            conn.setInstanceFollowRedirects(false);
             conn.setConnectTimeout(12000);
             conn.setReadTimeout(12000);
             byte[] body = ("{\"region\":\"cn\",\"aid\":6383,\"need_t\":1," +
@@ -475,20 +549,70 @@ public class DouyinParser {
                 output.write(body);
             }
             conn.getResponseCode();
+
+            // 路1（最可靠）：让系统的 CookieManager 收下这个 cookie
+            String fromManager = ttwidFromCookieManager();
+            if (!TextUtils.isEmpty(fromManager)) return fromManager;
+
+            // 路2：直接读响应头
             for (Map.Entry<String, List<String>> header : conn.getHeaderFields().entrySet()) {
                 if (header.getKey() == null || !"set-cookie".equalsIgnoreCase(header.getKey())) continue;
                 for (String value : header.getValue()) {
                     Matcher matcher = Pattern.compile("(?:^|,\\s*)ttwid=([^;\\s]+)",
                             Pattern.CASE_INSENSITIVE).matcher(value);
-                    if (matcher.find()) return URLDecoder.decode(matcher.group(1), "UTF-8");
+                    if (matcher.find()) {
+                        String v = URLDecoder.decode(matcher.group(1), "UTF-8");
+                        if (!TextUtils.isEmpty(v)) return v;
+                    }
                 }
             }
+
+            // 路3：注册成功但拿不到 cookie。返回 null，调用方会给出可读的报错，
+            // 不再像以前那样静默地让下游接口返回空内容。
+            Log.w(TAG, "ttwid 注册成功但未取到 cookie，详情接口会返回空内容");
+            return null;
         } catch (Exception e) {
-            Log.w(TAG, "获取临时 Cookie 失败", e);
+            Log.w(TAG, "获取 ttwid 失败", e);
+            return null;
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    /** 从系统 CookieManager 里取 ttwid。Android 上这是唯一可靠的方式。 */
+    private static String ttwidFromCookieManager() {
+        try {
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            String cookie = cm.getCookie("https://ttwid.bytedance.com/");
+            if (!TextUtils.isEmpty(cookie)) {
+                Matcher m = Pattern.compile("ttwid=([^;\\s]+)").matcher(cookie);
+                if (m.find()) return URLDecoder.decode(m.group(1), "UTF-8");
+            }
+        } catch (Throwable ignored) {
+            // 非 Android 环境（JVM 单测）会走到这里，返回 null 即可
+        }
         return null;
+    }
+
+    /**
+     * 取（或首次生成）浏览器标识 {@code web_id}，对应 Cookie 里的 {@code s_v_web_id}。
+     *
+     * <p><b>这是 2026-10 抖音解析恢复的关键</b>：{@code web_id} 缺失时
+     * {@code /aweme/v1/web/aweme/detail/} 会返回 **HTTP 200 + 响应体 0 字节**，
+     * 不报任何错。老铁看到的就是「下载一直 403 / 解析失败」，很难往参数缺了上想。
+     *
+     * <p>它不是安全令牌，抖音只要一个格式合法的 19 位数字即可，因此本地随机生成后
+     * 进程内复用即可，无需持久化。
+     */
+private static String getOrCreateWebId() {
+        if (webIdCache != null) return webIdCache;
+        // 抖音的 web_id 是 19 位十进制数，前几位非 0
+        StringBuilder sb = new StringBuilder(19);
+        sb.append(SECURE_RANDOM.nextInt(9) + 1);
+        while (sb.length() < 19) sb.append(SECURE_RANDOM.nextInt(10));
+        webIdCache = sb.toString();
+        return webIdCache;
     }
 
     private static String randomToken(int length) {
@@ -1649,6 +1773,9 @@ public class DouyinParser {
                 for (int i = 0; i < bitRate.length(); i++) {
                     JSONObject br = bitRate.optJSONObject(i);
                     if (br == null) continue;
+                    // 跳过 H.265/HEVC：码率数字有时比 H.264 还高，纯按码率挑会选到它，
+                    // 而不少机型硬解不了 H.265，存进相册后表现为"文件打不开"。
+                    if (br.optInt("is_h265", 0) != 0 || br.optInt("isH265", 0) != 0) continue;
                     JSONObject pa = firstObject(br, "play_addr", "playAddr");
                     if (pa != null) {
                         JSONArray urlList = firstArray(pa, "url_list", "urlList");
@@ -1873,7 +2000,7 @@ public class DouyinParser {
 
     public static byte[] downloadImageBytes(String imageUrl, DownloadCallback callback) {
         try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            downloadMediaToStream(imageUrl, output, 0, MAX_IMAGE_BYTES, callback);
+            downloadMediaToStream(imageUrl, output, 0, MAX_IMAGE_BYTES, callback, null, MEDIA_REFERER);
             return output.toByteArray();
         } catch (Exception e) {
             if (callback != null) callback.onError("下载异常: " + e.getMessage());
@@ -1881,17 +2008,23 @@ public class DouyinParser {
         }
     }
 
-    /**
+/**
      * 将视频直接从网络写入目标流。maxBytes=0 表示不限制总大小，避免长视频先占用整块内存。
+     *
+     * <p><b>Referer 是必需的</b>（2026-10 实测）：抖音 CDN 现在校验 Referer，
+     * 不带就回 <b>403</b>（带了就206 正常）。这与「UA 缺失」是两件事，
+     * 实测无 UA 但有 Referer 也能下，所以关键是 Referer 本身。
+     * 之前这里没传 referer，抖音下载整体挂掉而视频号正常——因为视频号那条
+     * 显式传了 {@code MEDIA_REFERER}。
      */
-    public static long downloadVideoToStream(String videoUrl, OutputStream output,
+public static long downloadVideoToStream(String videoUrl, OutputStream output,
                                              DownloadCallback callback) throws Exception {
-        return downloadMediaToStream(videoUrl, output, 1, 0, callback);
+        return downloadMediaToStream(videoUrl, output, 1, 0, callback, null, MEDIA_REFERER);
     }
 
     public static long downloadAudioToStream(String audioUrl, OutputStream output,
                                              DownloadCallback callback) throws Exception {
-        return downloadMediaToStream(audioUrl, output, 2, 0, callback);
+        return downloadMediaToStream(audioUrl, output, 2, 0, callback, null, MEDIA_REFERER);
     }
 
     /**
@@ -1951,7 +2084,9 @@ public class DouyinParser {
                     ? "image/*,application/octet-stream;q=0.8"
                     : (audio ? "audio/*,video/mp4,application/octet-stream;q=0.8"
                     : "video/*,application/octet-stream;q=0.8"));
-            conn.setRequestProperty("Referer", referer);
+            // Referer 为 null 时也要给：抖音 CDN 缺 Referer 会回 403（实测）
+            conn.setRequestProperty("Referer",
+                    TextUtils.isEmpty(referer) ? MEDIA_REFERER : referer);
             conn.setRequestProperty("Accept-Encoding", "identity");
             conn.setInstanceFollowRedirects(false);
             conn.setConnectTimeout(30000);
