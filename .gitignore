@@ -27,3 +27,9 @@ Thumbs.db
 *.aab
 *.ap_
 *.dex
+
+# ---- 内嵌凭据：主工程那份含真实登录态，绝不能进公开仓库 ----
+#公开仓库里只保留脱敏后的空壳版本（无任何长串常量）。
+# 真相机凭据在 SaveAssistant_MultiAgent_Handoff_*/Source/ 下，不要往这里 cp。
+app/src/main/java/com/zgtools/videosaver/BuiltInChannelCredential.java.local
+*Credential.local.java
