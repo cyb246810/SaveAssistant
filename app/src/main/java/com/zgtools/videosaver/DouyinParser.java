@@ -59,6 +59,13 @@ public class DouyinParser {
      * 有效期很长（实测同一枚连发多次都有效），故缓存复用，不必每次都注册。
      */
     private static volatile String ttwidCache = null;
+    /** ttwid 的缓存时刻，用来给缓存加 TTL，避免一枚用太久被抖音判失效。 */
+    private static volatile long ttwidCachedAt = 0L;
+    /**
+     * ttwid 缓存有效期。服务端给的是 Max-Age=31536000（一年），但保守起见
+     * 1 小时重新注册一次——多一次请求的代价远小于因 cookie 失效而 403。
+     */
+    private static final long TTWID_TTL_MS = 60L * 60L * 1000L;
     private static final Pattern SHARE_URL_PATTERN = Pattern.compile(
             "https://(?:[A-Za-z0-9-]+\\.)*(?:douyin\\.com|iesdouyin\\.com)/[^\\s]+",
             Pattern.CASE_INSENSITIVE);
@@ -475,7 +482,16 @@ public class DouyinParser {
         try {
             int code = conn.getResponseCode();
             if (code != HttpURLConnection.HTTP_OK) {
-                throw new Exception("详情接口响应码: " + code);
+                // 403 在抖音这里几乎总是「ttwid 不对/失效」，不是 IP 被封
+                // （本机用同一个 IP 反复测都是 200）。换一枚 ttwid 重试。
+                if (code == 403 && retry < 1) {
+                    Log.w(TAG, "详情接口 403，重置 ttwid 后重试一次");
+                    ttwidCache = null;
+                    ttwidCachedAt = 0L;
+                    return fetchAwemeDetail(awemeId, sourcePageUrl, retry + 1);
+                }
+                throw new Exception("详情接口响应码: " + code
+                        + (code == 403 ? "（抖音风控，通常换网络环境或稍后重试即可）" : ""));
             }
             String body = readLimited(conn, MAX_HTML_BYTES);
             // 抖音对"不合规"的请求回的是 200 + 空体，不是 403。分清这两种情况，
@@ -486,12 +502,17 @@ public class DouyinParser {
                 if (retry < 1 && !TextUtils.isEmpty(ttwid)) {
                     Log.w(TAG, "详情接口返回空内容，重置 ttwid 后重试一次");
                     ttwidCache = null;
+                    ttwidCachedAt = 0L;
                     return fetchAwemeDetail(awemeId, sourcePageUrl, retry + 1);
                 }
                 ttwidCache = null;
+                ttwidCachedAt = 0L;
                 throw new Exception("抖音接口返回了空内容（HTTP 200 但无数据），"
-                        + "且重试后依旧如此。这通常是抖音风控拦截，"
-                        + "换个网络环境（Wi-Fi/流量切换）或稍后重试即可");
+                        + "且重试后依旧如此"
+                        + (TextUtils.isEmpty(ttwid) ? "。注意：本次没能取到 ttwid 设备标识"
+                                + "（Cookie 请求头缺失），这是最可能的原因"
+                                : "。ttwid 已取到但仍被拦，说明 IP 段被风控")
+                        + "。请换一个网络环境（Wi-Fi ↔ 流量切换）后重试");
             }
             JSONObject json = new JSONObject(body);
             if (json.optJSONObject("aweme_detail") == null) {
@@ -520,9 +541,13 @@ public class DouyinParser {
      * <p>ttwid 有效期很长（实测同一枚连发多次都有效），故进程内缓存复用，不必每次注册。
      */
 private static String getTtwid() {
-        if (ttwidCache != null && !ttwidCache.isEmpty()) return ttwidCache;
+        if (ttwidCache != null && !ttwidCache.isEmpty()
+                && System.currentTimeMillis() - ttwidCachedAt < TTWID_TTL_MS) {
+            return ttwidCache;
+        }
         String ttwid = registerTtwid();
         ttwidCache = ttwid;
+        ttwidCachedAt = System.currentTimeMillis();
         return ttwid;
     }
 
@@ -550,11 +575,10 @@ private static String getTtwid() {
             }
             conn.getResponseCode();
 
-            // 路1（最可靠）：让系统的 CookieManager 收下这个 cookie
-            String fromManager = ttwidFromCookieManager();
-            if (!TextUtils.isEmpty(fromManager)) return fromManager;
-
-            // 路2：直接读响应头
+            // 路1（最可靠）：直接读本次响应的 Set-Cookie —— 拿到的就是刚下发的、
+            // 一定是新鲜的 cookie。实测 JVM 与 Android 都能正常读到。
+            // 刻意**不把 CookieManager 放在前面**：它可能返回几天前的旧 cookie，
+            // 一直复用会导致详情接口持续 403（本轮真机踩到）。
             for (Map.Entry<String, List<String>> header : conn.getHeaderFields().entrySet()) {
                 if (header.getKey() == null || !"set-cookie".equalsIgnoreCase(header.getKey())) continue;
                 for (String value : header.getValue()) {
@@ -566,6 +590,10 @@ private static String getTtwid() {
                     }
                 }
             }
+
+            // 路2：系统 CookieManager（万一某些网络栈真的不返回 Set-Cookie 头）
+            String fromManager = ttwidFromCookieManager();
+            if (!TextUtils.isEmpty(fromManager)) return fromManager;
 
             // 路3：注册成功但拿不到 cookie。返回 null，调用方会给出可读的报错，
             // 不再像以前那样静默地让下游接口返回空内容。

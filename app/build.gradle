@@ -9,8 +9,8 @@ android {
         applicationId "com.zgtools.videosaver"
         minSdk 29
         targetSdk 36
-        versionCode 66
-        versionName "1.11.12"
+        versionCode 67
+        versionName "1.11.13"
     }
 
     signingConfigs {
