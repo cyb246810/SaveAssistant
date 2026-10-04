@@ -1407,6 +1407,37 @@ public class MainActivity extends Activity {
     }
 
     /** 保存视频号登录态，并当场跑一次接口校验，避免"看起来存好了其实已失效"。 */
+    /**
+     * 跑一次抖音链路自检，把结果弹出来。
+     *
+     * <p>口令形如「保存助手诊断 7686877500249105009」，也允许直接只输「保存助手诊断」
+     * —— 没有作品 id 时用上次的，诊断 ttwid 与网络那一层不需要 id 也能看出问题。
+     */
+    private void runDouyinDiagnose(String input) {
+        String digits = input.replaceAll("[^0-9]", "");
+        String awemeId = digits.length() >= 10 ? digits : currentAwemeId;
+        final String title = "保存助手 · 抖音链路诊断";
+        setStatus("正在诊断抖音链路…", R.color.text_secondary);
+        Toast.makeText(this, "正在诊断，稍等…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String report = DouyinParser.diagnose(awemeId, this);
+            runOnUiThread(() -> {
+                setStatus("诊断完成，结果见下（已复制到剪贴板）",
+                        report.contains("正常，链路是通的") ? R.color.color_success : R.color.color_error);
+                android.content.ClipData clip = android.content.ClipData.newPlainText(title, report);
+                ((android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(clip);
+                new AlertDialog.Builder(this)
+                        .setTitle(title)
+                        .setMessage(report)
+                        .setPositiveButton("复制", (d, w) ->
+                                Toast.makeText(this, "已复制，可以直接发给我", Toast.LENGTH_SHORT).show())
+                        .setNegativeButton("关闭", null)
+                        .show();
+            });
+        }).start();
+    }
+
+    /** 保存视频号登录态，并当场跑一次接口校验，避免"看起来存好了其实已失效"。 */
     private void saveChannelCredential(String raw) {
         final java.util.Map<String, String> parsed = ChannelCredential.parse(raw);
         final String problem = ChannelCredential.diagnose(parsed);
@@ -1705,6 +1736,14 @@ public class MainActivity extends Activity {
     private void parseVideo(String link) {
         if (TextUtils.isEmpty(link)) {
             Toast.makeText(this, "请先粘贴分享链接", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // 诊断口令：在输入框里粘贴这段文字就能跑一次抖音链路自检。
+        // 本机 JVM 探针验证不到 Android 特有的那几层（系统 CookieManager 自动注入、
+        // 系统代理、省电策略），只能让手机自己报。
+        if (link.trim().startsWith("保存助手诊断")) {
+            runDouyinDiagnose(link);
             return;
         }
 

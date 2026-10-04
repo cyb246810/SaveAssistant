@@ -533,10 +533,14 @@ public class DouyinParser {
      * 而 {@code web_id}、{@code a_bogus} 都不影响是否返回数据。
      *
      * <p>踩过的坑：原来只靠 {@link HttpURLConnection#getHeaderFields()} 读
-     * {@code Set-Cookie}，在部分环境（桌面 JVM 实测、以及某些 Android 网络栈）下
-     * **根本读不到**，于是 ttwid 恒为 null，接口永远返回空。
-     * 现在改成三条路：Android 走系统 {@link CookieManager}（最可靠，它会真的存下cookie），
-     * 再回退到读 header，最后用一次「响应体里的 redirect_url」兜底。
+     * {@code Set-Cookie}，在部分环境下**根本读不到**，于是 ttwid 恒为 null，
+     * 接口永远返回空。
+     * 现在改成三条路：**先读本次响应的 Set-Cookie**（拿到的一定新鲜），
+     * 系统 {@link android.webkit.CookieManager} 只作兜底。
+     *
+     * <p>注册前会先清掉系统里的旧 ttwid、拿到新的写回去 —— 因为 Android 的
+     * CookieManager 会自动往每个请求注入 cookie，旧值会覆盖我们手动设的值。
+     * 详见 {@link #clearSystemTtwid()}。
      *
      * <p>ttwid 有效期很长（实测同一枚连发多次都有效），故进程内缓存复用，不必每次注册。
      */
@@ -554,6 +558,15 @@ private static String getTtwid() {
     private static String registerTtwid() {
         HttpURLConnection conn = null;
         try {
+            // 【2026-10-04 关键修复】Android 的 CookieManager 是**全局自动注入**的：
+            // 只要这台手机之前用浏览器/WebView 打开过抖音，系统里就存着一枚**旧 ttwid**。
+            // 详情接口我们手动 setRequestProperty("Cookie", ...) 后，系统仍会把
+            // CookieManager 里的旧 cookie **追加/覆盖**到请求头 —— 于是发出去的可能
+            // 是「旧 ttwid」或「两枚 ttwid 并存」，服务端解析到旧的那枚就 403。
+            // 本机 JVM 测不出来（JVM 没这套自动注入），只有真机会命中。
+            // → 注册前先把这枚旧 cookie 从系统里删掉，拿到新的立刻写回去，
+            //   保证 CookieManager 与我们手上的这枚**是同一个**。
+            clearSystemTtwid();
             conn = (HttpURLConnection) new URL(
                     "https://ttwid.bytedance.com/ttwid/union/register/").openConnection();
             conn.setRequestMethod("POST");
@@ -586,7 +599,12 @@ private static String getTtwid() {
                             Pattern.CASE_INSENSITIVE).matcher(value);
                     if (matcher.find()) {
                         String v = URLDecoder.decode(matcher.group(1), "UTF-8");
-                        if (!TextUtils.isEmpty(v)) return v;
+                        if (!TextUtils.isEmpty(v)) {
+                            // 立刻写回系统 CookieManager，让它与我们要发的是同一枚。
+                            // 不写回去的话，系统的旧值会在下一个请求里覆盖我们这枚。
+                            saveSystemTtwid(v);
+                            return v;
+                        }
                     }
                 }
             }
@@ -605,6 +623,199 @@ private static String getTtwid() {
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    /**
+     * 把系统 CookieManager 里的旧 ttwid 删掉。
+     *
+     * <p>Android 上 {@link android.webkit.CookieManager} 默认 {@code acceptCookie=true}，
+     * 会把命中域名的 cookie **自动附加到每个 HttpURLConnection 请求上**，且
+     * {@code setRequestProperty("Cookie", ...)} 手动设的值可能被系统 cookie **追加或覆盖**。
+     * 用户只要在手机上用浏览器打开过抖音，系统里就会留一枚旧 ttwid。
+     *
+     * <p><b>这是本机测不出来、只有真机才暴露的问题</b>（JVM 没有这套自动注入机制）。
+     */
+    private static void clearSystemTtwid() {
+        try {
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            // 设一个早已过期的 Max-Age，等于让系统立刻丢弃它。
+            // expires 用 1970 年，任何实现都会认为该cookie 已死。
+            cm.setCookie("https://ttwid.bytedance.com/",
+                    "ttwid=; Path=/; Domain=bytedance.com; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+            cm.flush();
+        } catch (Throwable ignored) {
+            // 非 Android 环境（JVM 单测）或系统未就绪，忽略即可
+        }
+    }
+
+    /** 把当前有效的 ttwid 写进系统 CookieManager，避免系统用旧值覆盖我们。 */
+    private static void saveSystemTtwid(String ttwid) {
+        try {
+            android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+            cm.setAcceptCookie(true);
+            cm.setCookie("https://ttwid.bytedance.com/",
+                    "ttwid=" + ttwid + "; Path=/; Domain=bytedance.com; Max-Age=31536000");
+            cm.flush();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 诊断：把抖音解析链路的真实状态收集成一段可读文本，给用户排查用。
+     *
+     * <p>为什么要这个：「本机能下、手机不能下」这类问题里，JVM 探针只能验证到
+     * 请求本身的正确性，**验证不到 Android 特有的那几层**（CookieManager 自动注入、
+     * 系统代理、Doze 省电策略、TLS 指纹）。有了这段文本，一次截图就能定位。
+     */
+    public static String diagnose(String awemeId, android.content.Context ctx) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            sb.append("· 系统 CookieManager 里的 ttwid：");
+            String sysTtwid = ttwidFromCookieManager();
+            sb.append(TextUtils.isEmpty(sysTtwid) ? "（空）" : shorten(sysTtwid, 28)).append('\n');
+            sb.append("· 应用缓存的 ttwid：");
+            sb.append(TextUtils.isEmpty(ttwidCache) ? "（空）" : shorten(ttwidCache, 28)).append('\n');
+
+            String fresh = registerTtwid();
+            sb.append("· 现场新注册的 ttwid：");
+            sb.append(TextUtils.isEmpty(fresh) ? "**注册失败（拿不到）**" : shorten(fresh, 28)).append('\n');
+
+            // 看注册接口的原始响应，把「为什么没下发 cookie」暴露出来
+            sb.append("· 注册接口响应：").append(probeRegisterResponse()).append('\n');
+
+            if (!TextUtils.isEmpty(fresh)) {
+                HttpURLConnection probe = openDetailConnection(awemeId, fresh);
+                if (probe != null) {
+                    try {
+                        int code = probe.getResponseCode();
+                        byte[] body = readBytes(probe, code);
+                        sb.append("· 详情接口：HTTP ").append(code)
+                                .append("，响应体 ").append(body.length).append(" 字节\n");
+                        if (code == 200 && body.length < 1000) {
+                            sb.append("  → 空响应：请求参数或 ttwid 被判不合规\n");
+                        } else if (code == 403) {
+                            sb.append("  → 403：抖音拦下了这个请求。最可能是这台手机的出口 IP 或 cookie 被风控。\n");
+                        } else if (code == 200) {
+                            sb.append("  → 正常，链路是通的\n");
+                        }
+                    } catch (Exception e) {
+                        sb.append("· 详情接口异常：").append(e.getMessage()).append('\n');
+                    } finally {
+                        probe.disconnect();
+                    }
+                }
+            }
+            sb.append("· 当前代理：").append(proxyInfo()).append('\n');
+            sb.append("· 电源优化是否限制后台：").append(powerInfo(ctx)).append('\n');
+        } catch (Exception e) {
+            sb.append("诊断中断：").append(e.getMessage());
+        }
+        return sb.toString();
+    }
+
+    private static String shorten(String s, int n) {
+        return s.length() <= n ? s : s.substring(0, n) + "…";
+    }
+
+    /** 读注册接口的原始状态，把服务端拒绝的原因原样带出来。 */
+    private static String probeRegisterResponse() {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(
+                    "https://ttwid.bytedance.com/ttwid/union/register/").openConnection();
+            conn.setRequestMethod("POST");
+            conn.setDoOutput(true);
+            conn.setRequestProperty("User-Agent", UA_DESKTOP);
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
+            byte[] body = ("{\"region\":\"cn\",\"aid\":6383,\"need_t\":1,\"service\":\"www.douyin.com\","
+                    + "\"migrate_priority\":0,\"cb_url_protocol\":\"https\",\"domain\":\".douyin.com\"}")
+                    .getBytes(StandardCharsets.UTF_8);
+            conn.setFixedLengthStreamingMode(body.length);
+            try (OutputStream output = conn.getOutputStream()) {
+                output.write(body);
+            }
+            int code = conn.getResponseCode();
+            boolean hasCookie = false;
+            for (Map.Entry<String, List<String>> h : conn.getHeaderFields().entrySet()) {
+                if (h.getKey() != null && "set-cookie".equalsIgnoreCase(h.getKey())
+                        && h.getValue() != null) {
+                    for (String v : h.getValue()) {
+                        if (v != null && v.contains("ttwid=")) hasCookie = true;
+                    }
+                }
+            }
+            conn.disconnect();
+            return "HTTP " + code + (hasCookie ? "，已下发 ttwid" : "，**未下发 ttwid**");
+        } catch (Exception e) {
+            return "异常：" + e.getMessage();
+        }
+    }
+
+    private static String proxyInfo() {
+        try {
+            // 注意：Android 的 HttpURLConnection **没有** getProxy(Type) 方法（编译不过），
+            // 只能走 ProxySelector。
+            java.util.List<java.net.Proxy> list = java.net.ProxySelector.getDefault()
+                    .select(new java.net.URI("https://www.douyin.com/"));
+            if (list == null || list.isEmpty()) return "无（直连）";
+            java.net.Proxy p = list.get(0);
+            return (p == null || p == java.net.Proxy.NO_PROXY || p.type() == java.net.Proxy.Type.DIRECT)
+                    ? "无（直连）" : p.toString();
+        } catch (Exception e) {
+            return "读不到";
+        }
+    }
+
+    private static String powerInfo(android.content.Context ctx) {
+        try {
+            // Context 可能为空（单元测试场景），此时跳过。
+            if (ctx == null) return "读不到";
+            android.os.PowerManager pm = (android.os.PowerManager)
+                    ctx.getSystemService(android.content.Context.POWER_SERVICE);
+            if (pm == null) return "读不到";
+            return pm.isIgnoringBatteryOptimizations("com.zgtools.videosaver") ? "未限制" : "**受限，可能断网**";
+        } catch (Throwable t) {
+            return "读不到";
+        }
+    }
+
+    /** 打开一个详情接口连接但不读响应体，供诊断复用。 */
+    private static HttpURLConnection openDetailConnection(String awemeId, String ttwid) throws Exception {
+        String webId = getOrCreateWebId();
+        String query = "device_platform=webapp&aid=6383&channel=channel_pc_web" +
+                "&pc_client_type=1&version_code=190500&version_name=19.5.0" +
+                "&cookie_enabled=true&screen_width=1920&screen_height=1080" +
+                "&browser_language=zh-CN&browser_platform=Win32&browser_name=Chrome" +
+                "&browser_version=123.0.0.0&browser_online=true&engine_name=Blink" +
+                "&engine_version=123.0.0.0&os_name=Windows&os_version=10" +
+                "&cpu_core_num=8&device_memory=8&platform=PC&downlink=10" +
+                "&effective_type=4g&round_trip_time=100&aweme_id=" + awemeId +
+                "&web_id=" + webId + "&msToken=" + java.net.URLEncoder.encode(randomToken(107), "UTF-8");
+        String signature = DouyinSign.generate(query, UA_DESKTOP);
+        HttpURLConnection conn = (HttpURLConnection) new URL(
+                "https://www.douyin.com/aweme/v1/web/aweme/detail/?" + query
+                        + "&a_bogus=" + java.net.URLEncoder.encode(signature, "UTF-8")).openConnection();
+        conn.setRequestProperty("User-Agent", UA_DESKTOP);
+        conn.setRequestProperty("Accept", "application/json, text/plain, */*");
+        conn.setRequestProperty("Referer", "https://www.douyin.com/video/" + awemeId);
+        conn.setRequestProperty("Cookie", "s_v_web_id=" + webId + "; ttwid=" + ttwid);
+        conn.setConnectTimeout(12000);
+        conn.setReadTimeout(15000);
+        return conn;
+    }
+
+    /** 读响应体，忽略长度上限（诊断用）。 */
+    private static byte[] readBytes(HttpURLConnection conn, int code) throws Exception {
+        java.io.InputStream is = (code == 200) ? conn.getInputStream() : conn.getErrorStream();
+        if (is == null) return new byte[0];
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) > 0) out.write(buf, 0, n);
+        return out.toByteArray();
     }
 
     /** 从系统 CookieManager 里取 ttwid。Android 上这是唯一可靠的方式。 */
