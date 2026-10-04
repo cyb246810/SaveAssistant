@@ -20,4 +20,3 @@ dependencyResolutionManagement {
 }
 rootProject.name = "VideoSaver"
 include ':app'
-include ':editor'

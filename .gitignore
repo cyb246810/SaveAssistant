@@ -13,7 +13,13 @@ keystore.properties
 pc-tool/config.json
 pc-tool/server.log
 pc-tool/Received/
+pc-app/config.json
+pc-app/server.log
+pc-app/server.lock
+pc-app/Received/
+pc-app/Downloads/
 __pycache__/
+*.pyc
 
 # ---- 编辑器 / 系统 ----
 .idea/
